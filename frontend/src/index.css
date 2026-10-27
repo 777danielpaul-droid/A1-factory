@@ -1,0 +1,5 @@
+@tailwind base; @tailwind components; @tailwind utilities;
+body { font-family: 'IBM Plex Sans', system-ui, sans-serif; background: #E4E1DA; color: #1C2024; }
+.display { font-family: 'Space Grotesk', system-ui, sans-serif; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+.checker { background-color: #fff; background-image: conic-gradient(#e5e5e5 25%, transparent 25% 50%, #e5e5e5 50% 75%, transparent 75%); background-size: 16px 16px; }
