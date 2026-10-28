@@ -117,3 +117,66 @@ async def generate_video(*, api_key: str, prompt: str, model_slug: str, duration
     name = f"video-{uuid.uuid4().hex}.mp4"
     (ASSETS / name).write_bytes(media.content)
     return {"url": f"/static/assets/{name}", "filename": name, "bytes": len(media.content), "provider": "Replicate", "model": slug}
+
+
+async def generate_sound_effect(*, api_key: str, prompt: str, duration_seconds: float = 5) -> dict:
+    """Generate a sound-effect track via ElevenLabs Sound Effects API."""
+    if not api_key.strip():
+        raise ValueError("Für den Soundeffekt fehlt der ElevenLabs-API-Key.")
+    if not prompt.strip():
+        raise ValueError("Bitte beschreibe den gewünschten Soundeffekt.")
+    if len(prompt) > 1000:
+        raise ValueError("Die Soundbeschreibung darf höchstens 1.000 Zeichen lang sein.")
+    duration_seconds = max(0.5, min(22.0, float(duration_seconds)))
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            "https://api.elevenlabs.io/v1/sound-generation",
+            headers={"xi-api-key": api_key.strip(), "Content-Type": "application/json", "Accept": "audio/mpeg"},
+            json={"text": prompt.strip(), "duration_seconds": duration_seconds, "prompt_influence": 0.7},
+        )
+    if response.status_code >= 400:
+        raise _safe_error(response, "ElevenLabs Sound Effects")
+    if not response.content or len(response.content) > 40_000_000:
+        raise RuntimeError("Der Soundanbieter lieferte keine gültige Audiodatei oder die Datei ist zu groß.")
+    name = f"sound-{uuid.uuid4().hex}.mp3"
+    (ASSETS / name).write_bytes(response.content)
+    return {"url": f"/static/assets/{name}", "filename": name, "bytes": len(response.content), "provider": "ElevenLabs Sound Effects"}
+
+
+def compose_video_audio(*, video_filename: str, audio_filename: str, audio_volume: float = 1.0) -> dict:
+    """Mux a generated audio asset into a generated local video asset using ffmpeg."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("Zum Zusammenführen wird ffmpeg benötigt. Installiere es auf dem Backend-System.")
+    for filename, pattern, label in (
+        (video_filename, r"video-[a-f0-9]{32}\.mp4", "Video"),
+        (audio_filename, r"sound-[a-f0-9]{32}\.mp3", "Audio"),
+    ):
+        if not re.fullmatch(pattern, filename or ""):
+            raise ValueError(f"{label}-Dateiname ist ungültig.")
+        path = (ASSETS / filename).resolve()
+        if path.parent != ASSETS.resolve() or not path.is_file():
+            raise ValueError(f"Die {label}-Datei wurde in der Factory nicht gefunden.")
+    audio_volume = max(0.0, min(2.0, float(audio_volume)))
+    output_name = f"video-mix-{uuid.uuid4().hex}.mp4"
+    output_path = ASSETS / output_name
+    video_path = ASSETS / video_filename
+    audio_path = ASSETS / audio_filename
+    # Replace any provider audio with the requested soundtrack; loop short effects to cover the clip.
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(video_path), "-stream_loop", "-1", "-i", str(audio_path),
+        "-filter:a", f"volume={audio_volume}", "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(output_path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+    except subprocess.TimeoutExpired as exc:
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError("Das Zusammenführen von Bild und Ton hat zu lange gedauert.") from exc
+    if result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size == 0:
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError("Video und Ton konnten nicht zusammengeführt werden. Prüfe die Medienformate.")
+    return {"url": f"/static/assets/{output_name}", "filename": output_name, "bytes": output_path.stat().st_size, "has_audio": True, "audio_source": audio_filename}

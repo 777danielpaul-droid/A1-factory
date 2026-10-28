@@ -123,3 +123,10 @@ Beim Öffnen startet A1 Factory direkt im **Boss-Chat**. Du kannst deinen Auftra
 Wenn der Boss einen Workflow vorschlägt, kannst du **Auftrag jetzt ausführen** wählen. Wallpaper-Fabrik, Marketing-Studio und Content-Studio werden direkt über die bestehende WebSocket-Verbindung gestartet. Bei einem Video-Workflow erzeugt **Video direkt erzeugen** mit dem gespeicherten Replicate-Token einen Clip anhand der Medienanalyse; bei `minimax/video-01` wird zusätzlich das erste repräsentative Einzelbild als visuelle Vorlage übergeben. Das bearbeitet nicht das Originalvideo framegenau, sondern erzeugt einen neuen Clip, der sich an Analyse und Referenzbild orientiert. Videogenerierung kann Guthaben verbrauchen.
 
 Der Boss löst keine externe Veröffentlichung automatisch aus: Etsy- und Shopify-Veröffentlichungen bleiben bei einer Boss-Delegation deaktiviert. Für Storytelling und Game Assets öffnet **Station öffnen** die jeweilige Station; dort muss die individuelle Generierung noch bestätigt werden. Für Text- und Produktions-Workflows müssen die jeweiligen KI- und Bildanbieter-Zugangsdaten hinterlegt sein.
+
+
+## Boss-Medienproduktion: Video mit Soundtrack
+
+Bei einem Boss-Auftrag, der ausdrücklich Ton, Musik oder Soundeffekte verlangt, kann die Factory jetzt einen Soundtrack über ElevenLabs Sound Effects erzeugen und mit dem generierten Replicate-Video zu einer MP4 zusammenführen. Dafür müssen unter **Audio & Video** ein Replicate-Token und ein ElevenLabs-API-Key hinterlegt sein. Das Backend benötigt außerdem `ffmpeg`. Die Tonspur wird bis zum Ende des Clips wiederholt, wenn der Soundeffekt kürzer als das Video ist.
+
+Hinweis: Die Qualität der konkreten Bewegung hängt weiterhin vom gewählten Videomodell ab. Die Factory erhält die Originalanweisung und weist auf Fehler beim Erzeugen oder Zusammenführen hin; sie kann nicht garantieren, dass das externe Modell jede Bewegung exakt darstellt.

@@ -1,5 +1,5 @@
 import unittest
-from services.media_generation import generate_speech, generate_video
+from services.media_generation import generate_speech, generate_video, generate_sound_effect, compose_video_audio
 
 
 class MediaValidationTests(unittest.IsolatedAsyncioTestCase):
@@ -26,6 +26,18 @@ class MediaValidationTests(unittest.IsolatedAsyncioTestCase):
     async def test_video_rejects_invalid_reference_image(self):
         with self.assertRaisesRegex(ValueError, "Referenzbild"):
             await generate_video(api_key="dummy", prompt="Eine Szene", model_slug="minimax/video-01", reference_image_data_url="not-a-data-url")
+
+    async def test_sound_effect_requires_key(self):
+        with self.assertRaisesRegex(ValueError, "ElevenLabs-API-Key"):
+            await generate_sound_effect(api_key="", prompt="Lautes Katzenmiauen")
+
+    async def test_sound_effect_requires_prompt(self):
+        with self.assertRaisesRegex(ValueError, "Soundeffekt"):
+            await generate_sound_effect(api_key="dummy", prompt=" ")
+
+    def test_compose_rejects_non_factory_filenames(self):
+        with self.assertRaisesRegex(ValueError, "Dateiname ist ungültig"):
+            compose_video_audio(video_filename="../../secret.mp4", audio_filename="sound-" + "a" * 32 + ".mp3")
 
 
 if __name__ == "__main__":

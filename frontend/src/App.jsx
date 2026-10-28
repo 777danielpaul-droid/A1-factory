@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import StorytellingWorkspace from './StorytellingWorkspace.jsx';
 import GameAssetsWorkspace from './GameAssetsWorkspace.jsx';
 import AudioVideoWorkspace from './AudioVideoWorkspace.jsx';
+import MediaLibraryWorkspace from './MediaLibraryWorkspace.jsx';
 import GlobeBackground from './GlobeBackground.jsx';
 
 const API = import.meta.env.VITE_API_URL || 'localhost:8000';
@@ -593,7 +594,7 @@ export default function App() {
       setBossAttachment(null); setBossMediaMenu(false);
       if (data.workflow && data.workflow !== 'none') {
         const visualContext = (data.media_analysis || []).map(a => `${a.name}: ${(a.frames || []).map(f => f.summary).join(' ')}`).join('\n');
-        const mediaPrompt = [data.category, message, visualContext ? `Visuelle Referenzanalyse:\n${visualContext}` : ''].filter(Boolean).join('\n\n').slice(0, 1900);
+        const mediaPrompt = [`Erfülle die Nutzeranweisung so genau wie möglich. Bewahre alle konkreten Aktionen, Bewegungen, Motive und Stilvorgaben; ersetze sie nicht durch eine allgemeinere Szene.`, `Aufgabe: ${data.category || 'Medienproduktion'}`, `Originalanweisung des Nutzers (maßgeblich): ${message}`, visualContext ? `Visuelle Referenzanalyse:\n${visualContext}` : ''].filter(Boolean).join('\n\n').slice(0, 2000);
         setBossMediaPrompt(mediaPrompt);
         setBossPlan({ ...data, mediaPrompt, videoReferenceFrame: data.video_reference_frame_data_url || '' });
       }
@@ -614,17 +615,45 @@ export default function App() {
     const plannedCategory = bossPlan.category?.trim() || category;
     if (target === 'media') {
       let mediaCfg = {};
-      try { mediaCfg = JSON.parse(localStorage.getItem('agent-factory.media.v1') || '{}'); } catch { mediaCfg = {}; }
+      try { mediaCfg = JSON.parse(localStorage.getItem('agent-factory.media.v1') || '{}'); } catch {}
       if (!mediaCfg.replicateKey?.trim()) {
-        setBossError('Für die direkte Videogenerierung fehlt der Replicate-Token. Öffne Audio & Video, hinterlege ihn einmal und starte den Boss-Auftrag erneut.');
+        setBossError('Für die Videogenerierung fehlt der Replicate-Token. Öffne Audio & Video, hinterlege ihn einmal und starte den Boss-Auftrag erneut.');
         setTab('media');
         return;
       }
-      const prompt = (bossPlan.mediaPrompt || plannedCategory).slice(0, 2000);
+      const originalRequest = String(bossPlan.mediaPrompt || plannedCategory).slice(0, 2000);
+      const wantsSound = /\b(soundtrack|sound effects?|audio|sound|musik|tonspur|hintergrundmusik|miauen|miau|katzen?geräusch|geräusch|soundeffekt|sprechen|spricht|voice.?over|gesang|singen)\b/i.test(originalRequest);
+      if (wantsSound && !mediaCfg.elevenlabsKey?.trim()) {
+        setBossError('Für den gewünschten Soundtrack fehlt der ElevenLabs-API-Key. Hinterlege ihn unter Audio & Video → Zugangsdaten; der Boss kann dann Bild und Ton automatisch zusammenführen.');
+        setTab('media');
+        return;
+      }
+      const requestedAction = originalRequest.replace(/^Aufgabe:[^\n]*\n\n/, '');
+      const prompt = `${requestedAction}\n\nWichtig: Setze die ausdrücklich verlangte Handlung sichtbar um. Keine Ersatzhandlung und keine bloße Vorwärtsbewegung, wenn eine konkrete Tanzbewegung verlangt ist.`.slice(0, 2000);
       setBossBusy(true); setBossError('');
-      fetch(`${API_ORIGIN}/api/media/video`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: mediaCfg.replicateKey, prompt, model_slug: mediaCfg.videoModel || 'minimax/video-01', duration_seconds: Number(mediaCfg.duration || 5), reference_image_data_url: bossPlan.videoReferenceFrame || '' }) })
-        .then(async response => { const data = await response.json(); if (!response.ok) throw new Error(data.detail || 'Videogenerierung fehlgeschlagen.'); setBossMessages(items => [...items, { role: 'assistant', content: `Video fertig: ${data.filename || 'Videoclip'} (${data.model || 'Replicate'}).`, generatedMedia: `${API_ORIGIN}${data.url}` }]); setBossPlan(null); log('Boss', `Video erzeugt: ${data.filename || 'Videoclip'}`); })
-        .catch(error => setBossError(error.message || 'Videogenerierung fehlgeschlagen.'))
+      (async () => {
+        const videoResponse = await fetch(`${API_ORIGIN}/api/media/video`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: mediaCfg.replicateKey, prompt, model_slug: mediaCfg.videoModel || 'minimax/video-01', duration_seconds: Number(mediaCfg.duration || 5), reference_image_data_url: bossPlan.videoReferenceFrame || '' }) });
+        const video = await videoResponse.json();
+        if (!videoResponse.ok) throw new Error(video.detail || 'Videogenerierung fehlgeschlagen.');
+        let finalMedia = video;
+        let status = `Video erstellt (${video.model || 'Replicate'}).`;
+        if (wantsSound) {
+          const soundPrompt = /miauen|miau|katzen?geräusch/i.test(originalRequest)
+            ? 'Loud, clear, realistic cat meowing repeatedly as a prominent soundtrack. No speech, no music, no other foreground sounds.'
+            : `Create the sound effects/music explicitly requested here. Soundtrack brief: ${originalRequest}. Produce audio only; preserve the requested sound type, mood, and intensity.`;
+          const soundResponse = await fetch(`${API_ORIGIN}/api/media/sound-effects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: mediaCfg.elevenlabsKey, prompt: soundPrompt, duration_seconds: Math.min(22, Math.max(3, Number(mediaCfg.duration || 5))) }) });
+          const sound = await soundResponse.json();
+          if (!soundResponse.ok) throw new Error(`Video wurde erstellt, aber der Soundtrack schlug fehl: ${sound.detail || 'unbekannter Fehler'}. Du kannst den Clip in Audio & Video erneut bearbeiten.`);
+          const composeResponse = await fetch(`${API_ORIGIN}/api/media/compose`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ video_filename: video.filename, audio_filename: sound.filename, audio_volume: 1 }) });
+          const composed = await composeResponse.json();
+          if (!composeResponse.ok) throw new Error(`Video und Sound wurden erzeugt, aber nicht zusammengeführt: ${composed.detail || 'unbekannter Fehler'}.`);
+          finalMedia = composed;
+          status = `Fertiges Video mit Soundtrack erstellt. Video: ${video.model || 'Replicate'} · Audio: ElevenLabs Sound Effects · Audiospur vorhanden.`;
+        }
+        setBossMessages(items => [...items, { role: 'assistant', content: status, generatedMedia: `${API_ORIGIN}${finalMedia.url}` }]);
+        setBossPlan(null); log('Boss', status);
+      })()
+        .catch(error => setBossError(error.message || 'Medienproduktion fehlgeschlagen.'))
         .finally(() => setBossBusy(false));
       return;
     }
@@ -705,13 +734,13 @@ export default function App() {
         </header>
 
         <div className="flex gap-2 mb-6" role="tablist">
-          {[['boss', 'Boss-Chat'], ['factory', 'Wallpaper-Fabrik'], ['studio', 'Marketing-Studio'], ['content', 'Content-Studio'], ['story', 'Storytelling'], ['game-assets', 'Game Assets'], ['media', 'Audio & Video']].map(([k, l]) => (
+          {[['boss', 'Boss-Chat'], ['factory', 'Wallpaper-Fabrik'], ['studio', 'Marketing-Studio'], ['content', 'Content-Studio'], ['story', 'Storytelling'], ['game-assets', 'Game Assets'], ['media', 'Audio & Video'], ['library', 'Medienbibliothek']].map(([k, l]) => (
             <button key={k} role="tab" aria-selected={tab === k} onClick={() => setTab(k)} disabled={running}
               className={`display font-bold px-4 py-2 rounded-t border-b-4 text-sm ${tab === k ? 'border-[#E8590C] bg-white' : 'border-transparent text-stone-600 hover:bg-[#EFEDE7]'}`}>{l}</button>
           ))}
         </div>
 
-        {tab === 'boss' ? <section className="bg-white border border-stone-400 rounded-lg p-4 md:p-6">
+        {tab === 'library' ? <MediaLibraryWorkspace apiOrigin={API_ORIGIN} /> : tab === 'boss' ? <section className="bg-white border border-stone-400 rounded-lg p-4 md:p-6">
           <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
             <div><h2 className="display text-2xl font-bold">Boss-Zentrale</h2><p className="text-sm text-stone-600 mt-1">Aufträge besprechen, Workflow planen und zur passenden Station wechseln.</p></div>
             <span className="text-xs rounded bg-[#FFF4EC] border border-[#E8590C] px-2 py-1">KI: {PROVIDERS.find(p => p[0] === provider)?.[1] || provider}</span>
@@ -721,7 +750,7 @@ export default function App() {
             {bossBusy && <p className="text-sm text-stone-500 animate-pulse">Boss denkt nach…</p>}
           </div>
           {bossError && <p className="text-sm text-red-700 mt-2" role="alert">{bossError}</p>}
-          {bossPlan && <div className="mt-4 border border-[#E8590C] bg-[#FFF4EC] rounded p-3"><p className="font-semibold text-sm">Workflow vorgeschlagen: {({factory:'Wallpaper-Fabrik',studio:'Marketing-Studio',content:'Content-Studio',story:'Storytelling','game-assets':'Game Assets',media:'Audio & Video'})[bossPlan.workflow] || bossPlan.workflow}</p>{bossPlan.category && <p className="text-sm mt-1">Aufgabe: {bossPlan.category}</p>}{bossPlan.next_step && <p className="text-sm text-stone-700 mt-1">Nächster Schritt: {bossPlan.next_step}</p>}<div className="mt-3 flex flex-wrap gap-2"><button type="button" onClick={executeBossPlan} disabled={bossPlan.workflow === 'media' ? bossBusy : (running || !connected)} className="bg-[#E8590C] text-white font-semibold rounded px-4 py-2 text-sm hover:bg-orange-700 disabled:opacity-50">{['factory','studio','content'].includes(bossPlan.workflow) ? 'Auftrag jetzt ausführen' : bossPlan.workflow === 'media' ? 'Video direkt erzeugen' : 'Station öffnen'}</button><button type="button" onClick={applyBossPlan} className="border border-stone-400 bg-white text-stone-800 font-semibold rounded px-4 py-2 text-sm">Nur übernehmen</button></div><p className="text-xs text-stone-600 mt-2">Fabrik, Marketing und Content werden direkt an die vorhandenen Produktionspipelines übergeben. Bei Videoaufträgen nutzt der Boss die Medienanalyse als Prompt und übergibt beim Modell minimax/video-01 zusätzlich ein Referenz-Einzelbild. Die Generierung kann Guthaben bei Replicate verbrauchen. Veröffentlichungen bei Etsy/Shopify werden nicht automatisch ausgelöst.</p></div>}
+          {bossPlan && <div className="mt-4 border border-[#E8590C] bg-[#FFF4EC] rounded p-3"><p className="font-semibold text-sm">Workflow vorgeschlagen: {({factory:'Wallpaper-Fabrik',studio:'Marketing-Studio',content:'Content-Studio',story:'Storytelling','game-assets':'Game Assets',media:'Audio & Video',library:'Medienbibliothek'})[bossPlan.workflow] || bossPlan.workflow}</p>{bossPlan.category && <p className="text-sm mt-1">Aufgabe: {bossPlan.category}</p>}{bossPlan.next_step && <p className="text-sm text-stone-700 mt-1">Nächster Schritt: {bossPlan.next_step}</p>}<div className="mt-3 flex flex-wrap gap-2"><button type="button" onClick={executeBossPlan} disabled={bossPlan.workflow === 'media' ? bossBusy : (running || !connected)} className="bg-[#E8590C] text-white font-semibold rounded px-4 py-2 text-sm hover:bg-orange-700 disabled:opacity-50">{['factory','studio','content'].includes(bossPlan.workflow) ? 'Auftrag jetzt ausführen' : bossPlan.workflow === 'media' ? 'Medienproduktion starten' : 'Station öffnen'}</button><button type="button" onClick={applyBossPlan} className="border border-stone-400 bg-white text-stone-800 font-semibold rounded px-4 py-2 text-sm">Nur übernehmen</button></div><p className="text-xs text-stone-600 mt-2">Fabrik, Marketing und Content werden direkt an die vorhandenen Produktionspipelines übergeben. Bei Medienaufträgen versucht der Boss, die Originalanweisung zu erhalten. Wenn Sound gewünscht ist, erzeugt er zusätzlich einen Soundeffekt und fügt ihn mit ffmpeg als Audiospur in das Video ein. Dafür werden Replicate und ElevenLabs benötigt; die Generierung kann kostenpflichtig sein. Veröffentlichungen bei Etsy/Shopify werden nicht automatisch ausgelöst.</p></div>}
           <form onSubmit={sendBossMessage} className="mt-4 flex flex-col gap-2"><textarea value={bossDraft} onChange={e => setBossDraft(e.target.value)} rows={3} maxLength={6000} placeholder="Schreib oder sprich deinen Auftrag… Du kannst auch direkt ein Bild oder Video anhängen." className={`${field} flex-1 resize-y`} />
             {bossAttachment && <div className="flex items-center gap-3 rounded border border-stone-300 bg-stone-50 p-3">{bossAttachment.kind === 'image' ? <img src={bossAttachment.previewUrl} alt="Vorschau" className="h-16 w-16 rounded object-cover" /> : <div className="flex h-16 w-16 items-center justify-center rounded bg-stone-200 text-2xl">🎬</div>}<div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{bossAttachment.name}</p><p className="text-xs text-stone-500">{bossAttachment.kind === 'image' ? 'Bildreferenz' : 'Videoreferenz'} · {(bossAttachment.size / 1024 / 1024).toFixed(1)} MB</p></div><button type="button" onClick={() => { URL.revokeObjectURL(bossAttachment.previewUrl); setBossAttachment(null); }} className="text-sm underline">Entfernen</button></div>}
             <div className="flex flex-wrap gap-2"><div className="relative"><button type="button" onClick={() => setBossMediaMenu(v => !v)} aria-expanded={bossMediaMenu} className="font-semibold rounded px-4 py-3 border border-stone-400 bg-white text-stone-800 hover:bg-stone-100">＋ Medien hinzufügen ▾</button>{bossMediaMenu && <div className="absolute bottom-full left-0 z-20 mb-1 min-w-56 rounded border border-stone-300 bg-white p-1 shadow-lg"><button type="button" onClick={() => { if (bossFileInputRef.current) { bossFileInputRef.current.accept = 'image/*'; bossFileInputRef.current.click(); } setBossMediaMenu(false); }} className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-stone-100">🖼️ Bild als Referenz hinzufügen</button><button type="button" onClick={() => { if (bossFileInputRef.current) { bossFileInputRef.current.accept = 'video/*'; bossFileInputRef.current.click(); } setBossMediaMenu(false); }} className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-stone-100">🎬 Video als Referenz hinzufügen</button></div>}<input ref={bossFileInputRef} type="file" accept="image/*,video/*" onChange={onBossAttachment} className="hidden" /></div><button type="button" onClick={toggleSpeechInput} disabled={!speechSupported && !speechListening} aria-pressed={speechListening} className={`font-semibold rounded px-4 py-3 border disabled:opacity-50 ${speechListening ? 'bg-red-700 text-white border-red-700' : 'bg-white text-stone-800 border-stone-400 hover:bg-stone-100'}`}>{speechListening ? '■ Aufnahme stoppen' : '🎙️ Per Sprache eingeben'}</button><button type="submit" disabled={bossBusy || (!bossDraft.trim() && !bossAttachment)} className="bg-[#E8590C] text-white font-semibold rounded px-5 py-3 disabled:opacity-50">{bossBusy ? 'Denkt…' : 'An Boss senden'}</button></div>{speechListening && <p className="text-sm text-red-700" role="status">Ich höre zu … Sprich deinen Auftrag. Stoppe die Aufnahme, wenn du fertig bist.</p>}{!speechSupported && <p className="text-xs text-stone-500">Sprachsteuerung benötigt einen Browser mit Web Speech API, z. B. Chrome oder Edge, sowie Mikrofonfreigabe.</p>}<p className="text-xs text-stone-500">Bilder werden visuell analysiert und als Referenz für den nächsten Produktionsauftrag übernommen. Videos werden gespeichert und anhand von drei repräsentativen Einzelbildern visuell analysiert. Die Analyse fließt in die Workflow-Empfehlung ein; sie ist keine vollständige Einzelbild-für-Einzelbild-Prüfung. Maximal 12 MB pro Datei.</p></form>

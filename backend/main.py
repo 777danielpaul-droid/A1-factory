@@ -20,7 +20,7 @@ from story_store import init_story_db, list_characters, get_character, save_char
 from game_asset_store import init_game_asset_db, save_game_asset, list_game_assets, delete_game_asset  # noqa: E402
 from services.pixellab import PixelLabClient, PixelLabError  # noqa: E402
 
-from services.media_generation import generate_speech, generate_video  # noqa: E402
+from services.media_generation import generate_speech, generate_video, generate_sound_effect, compose_video_audio  # noqa: E402
 
 BASE = Path(__file__).resolve().parent
 (BASE / "output" / "assets").mkdir(parents=True, exist_ok=True)
@@ -111,6 +111,82 @@ async def api_generate_video(req: VideoRequest):
         raise HTTPException(502, str(exc)) from exc
     except httpx.TimeoutException as exc:
         raise HTTPException(504, "Videogenerierung dauert zu lange. Prüfe das Modell bei Replicate und versuche es erneut.") from exc
+
+
+class SoundEffectRequest(BaseModel):
+    api_key: str = Field(min_length=1, max_length=500)
+    prompt: str = Field(min_length=1, max_length=1000)
+    duration_seconds: float = Field(default=5, ge=0.5, le=22)
+
+
+@app.post("/api/media/sound-effects")
+async def api_generate_sound_effect(req: SoundEffectRequest):
+    try:
+        return await generate_sound_effect(api_key=req.api_key, prompt=req.prompt, duration_seconds=req.duration_seconds)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "Soundeffekt-Generierung dauerte zu lange.") from exc
+
+
+class ComposeMediaRequest(BaseModel):
+    video_filename: str = Field(min_length=1, max_length=100)
+    audio_filename: str = Field(min_length=1, max_length=100)
+    audio_volume: float = Field(default=1.0, ge=0, le=2)
+
+
+@app.post("/api/media/compose")
+def api_compose_media(req: ComposeMediaRequest):
+    try:
+        return compose_video_audio(video_filename=req.video_filename, audio_filename=req.audio_filename, audio_volume=req.audio_volume)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+MEDIA_EXTENSIONS = {
+    ".mp4": "video", ".webm": "video", ".mov": "video", ".m4v": "video",
+    ".mp3": "audio", ".wav": "audio", ".m4a": "audio", ".aac": "audio", ".ogg": "audio", ".flac": "audio",
+    ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image", ".gif": "image",
+}
+
+
+@app.get("/api/media/library")
+def api_media_library():
+    """List generated media files stored in output/assets, newest first."""
+    assets_dir = (BASE / "output" / "assets").resolve()
+    items = []
+    for path in assets_dir.iterdir():
+        if not path.is_file() or path.is_symlink() or path.suffix.lower() not in MEDIA_EXTENSIONS:
+            continue
+        stat = path.stat()
+        items.append({
+            "filename": path.name,
+            "kind": MEDIA_EXTENSIONS[path.suffix.lower()],
+            "url": f"/static/assets/{path.name}",
+            "bytes": stat.st_size,
+            "modified_at": stat.st_mtime,
+        })
+    items.sort(key=lambda item: item["modified_at"], reverse=True)
+    return {"items": items, "count": len(items), "total_bytes": sum(item["bytes"] for item in items)}
+
+
+@app.delete("/api/media/library/{filename}")
+def api_delete_media(filename: str):
+    """Delete one generated media file; never accepts paths or non-media files."""
+    if filename in {".", ".."} or Path(filename).name != filename or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "Ungültiger Dateiname.")
+    path = BASE / "output" / "assets" / filename
+    if path.is_symlink() or not path.is_file() or path.suffix.lower() not in MEDIA_EXTENSIONS:
+        raise HTTPException(404, "Mediendatei nicht gefunden.")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(500, "Datei konnte nicht gelöscht werden.") from exc
+    return {"deleted": filename}
 
 
 class ProductCreate(BaseModel):
