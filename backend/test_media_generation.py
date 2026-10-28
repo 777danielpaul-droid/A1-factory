@@ -23,6 +23,10 @@ class MediaValidationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Beschreibung für das Video"):
             await generate_video(api_key="dummy", prompt=" ", model_slug="minimax/video-01")
 
+    async def test_video_rejects_invalid_reference_image(self):
+        with self.assertRaisesRegex(ValueError, "Referenzbild"):
+            await generate_video(api_key="dummy", prompt="Eine Szene", model_slug="minimax/video-01", reference_image_data_url="not-a-data-url")
+
 
 if __name__ == "__main__":
     unittest.main()

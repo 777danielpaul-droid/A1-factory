@@ -55,7 +55,7 @@ async def generate_speech(*, api_key: str, text: str, voice_id: str, model_id: s
     return {"url": f"/static/assets/{name}", "filename": name, "bytes": len(response.content), "provider": "ElevenLabs"}
 
 
-async def generate_video(*, api_key: str, prompt: str, model_slug: str, duration_seconds: int = 5) -> dict:
+async def generate_video(*, api_key: str, prompt: str, model_slug: str, duration_seconds: int = 5, reference_image_data_url: str = "") -> dict:
     if not api_key.strip():
         raise ValueError("Bitte einen Replicate-API-Token eintragen.")
     if not prompt.strip():
@@ -68,11 +68,19 @@ async def generate_video(*, api_key: str, prompt: str, model_slug: str, duration
     duration_seconds = max(3, min(10, int(duration_seconds)))
     owner, model = slug.split("/", 1)
     headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json", "Prefer": "wait=60"}
+    model_input = {"prompt": prompt.strip(), "duration": duration_seconds}
+    if reference_image_data_url:
+        match = re.fullmatch(r"data:image/(?:jpeg|png|webp);base64,([A-Za-z0-9+/=]+)", reference_image_data_url)
+        if not match or len(reference_image_data_url) > 500_000:
+            raise ValueError("Das Referenzbild für die Videogenerierung ist ungültig oder zu groß.")
+        # minimax/video-01 accepts a first-frame image. Other model schemas vary, so don't send unsupported fields.
+        if slug.lower() == "minimax/video-01":
+            model_input["first_frame_image"] = reference_image_data_url
     async with httpx.AsyncClient(timeout=90, follow_redirects=False) as client:
         response = await client.post(
             f"https://api.replicate.com/v1/models/{owner}/{model}/predictions",
             headers=headers,
-            json={"input": {"prompt": prompt.strip(), "duration": duration_seconds}},
+            json={"input": model_input},
         )
         if response.status_code >= 400:
             raise _safe_error(response, "Replicate")

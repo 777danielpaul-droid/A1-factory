@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import StorytellingWorkspace from './StorytellingWorkspace.jsx';
 import GameAssetsWorkspace from './GameAssetsWorkspace.jsx';
 import AudioVideoWorkspace from './AudioVideoWorkspace.jsx';
+import GlobeBackground from './GlobeBackground.jsx';
 
 const API = import.meta.env.VITE_API_URL || 'localhost:8000';
 const API_ORIGIN = `http://${API}`;
@@ -304,7 +305,21 @@ export default function App() {
   const [provider, setProvider] = useState('groq');
   const [publish, setPublish] = useState(false);
   const [count, setCount] = useState(3);
-  const [tab, setTab] = useState('factory');
+  const [tab, setTab] = useState('boss');
+  const [accentColor, setAccentColor] = useState(() => { try { return localStorage.getItem('a1-factory.accent') || '#8B5CF6'; } catch { return '#8B5CF6'; } });
+  useEffect(() => { document.documentElement.style.setProperty('--a1-accent', accentColor); try { localStorage.setItem('a1-factory.accent', accentColor); } catch {} }, [accentColor]);
+  const [bossMessages, setBossMessages] = useState([{ role: 'assistant', content: 'Ich bin der Boss. Beschreibe dein Ziel; ich helfe dir, den passenden Workflow und die nächsten Schritte festzulegen.' }]);
+  const [bossDraft, setBossDraft] = useState('');
+  const [bossAttachment, setBossAttachment] = useState(null);
+  const [bossMediaMenu, setBossMediaMenu] = useState(false);
+  const bossFileInputRef = useRef(null);
+  const [speechListening, setSpeechListening] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(false);
+  const speechRef = useRef(null);
+  const [bossBusy, setBossBusy] = useState(false);
+  const [bossError, setBossError] = useState('');
+  const [bossPlan, setBossPlan] = useState(null);
+  const [bossMediaPrompt, setBossMediaPrompt] = useState('');
   const [modules, setModules] = useState({ merch: true, brand: true, mockups: true });
   const [variants, setVariants] = useState(2);
   const [withMockups, setWithMockups] = useState(true);
@@ -336,6 +351,50 @@ export default function App() {
   const log = useCallback((source, text, error = false) => {
     setLogs(l => [...l.slice(-199), { t: new Date().toLocaleTimeString('de-DE'), source, text, error }]);
   }, []);
+
+  useEffect(() => {
+    setSpeechSupported(typeof window !== 'undefined' && !!(window.SpeechRecognition || window.webkitSpeechRecognition));
+    return () => {
+      if (speechRef.current) { speechRef.current.onend = null; speechRef.current.stop(); speechRef.current = null; }
+    };
+  }, []);
+
+  const toggleSpeechInput = () => {
+    if (speechListening) {
+      speechRef.current?.stop();
+      setSpeechListening(false);
+      return;
+    }
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) {
+      setBossError('Spracherkennung wird in diesem Browser nicht unterstützt. Bitte nutze Chrome oder Edge oder tippe deinen Auftrag ein.');
+      return;
+    }
+    const recognition = new Recognition();
+    speechRef.current = recognition;
+    recognition.lang = 'de-DE';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    let finalTranscript = '';
+    recognition.onstart = () => { setSpeechListening(true); setBossError(''); };
+    recognition.onresult = (event) => {
+      let interim = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const text = event.results[i][0]?.transcript || '';
+        if (event.results[i].isFinal) finalTranscript += `${text} `;
+        else interim += text;
+      }
+      const transcript = `${finalTranscript}${interim}`.trim();
+      if (transcript) setBossDraft(transcript);
+    };
+    recognition.onerror = (event) => {
+      setSpeechListening(false);
+      const message = event.error === 'not-allowed' ? 'Mikrofonzugriff verweigert. Erlaube den Mikrofonzugriff in den Browser-Einstellungen.' : `Spracherkennung fehlgeschlagen (${event.error}).`;
+      setBossError(message);
+    };
+    recognition.onend = () => { setSpeechListening(false); speechRef.current = null; };
+    try { recognition.start(); } catch (error) { setSpeechListening(false); setBossError(`Mikrofon konnte nicht gestartet werden: ${error.message}`); }
+  };
 
   useEffect(() => {
     let closed = false, timer;
@@ -496,29 +555,178 @@ export default function App() {
     log('Du', `Start mit ${provider}: ${category}`);
   };
 
+  const onBossAttachment = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const isImage = file.type.startsWith('image/');
+    const isVideo = file.type.startsWith('video/');
+    if (!isImage && !isVideo) { setBossError('Bitte eine Bild- oder Videodatei auswählen.'); return; }
+    const maxBytes = 12 * 1024 * 1024;
+    if (file.size > maxBytes) { setBossError('Die Datei ist zu groß. Bitte nutze maximal 12 MB.'); return; }
+    try {
+      const dataUrl = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error('Datei konnte nicht gelesen werden.')); reader.readAsDataURL(file); });
+      setBossAttachment({ name: file.name, type: file.type, kind: isImage ? 'image' : 'video', size: file.size, dataUrl, previewUrl: URL.createObjectURL(file) });
+      setBossError('');
+    } catch (error) { setBossError(error.message); }
+  };
+
+  const sendBossMessage = async (event) => {
+    event?.preventDefault();
+    const message = bossDraft.trim();
+    if ((!message && !bossAttachment) || bossBusy) return;
+    const previous = bossMessages;
+    const displayContent = message || `Bitte verwende diese ${bossAttachment.kind === 'image' ? 'Bildreferenz' : 'Videoreferenz'}: ${bossAttachment.name}`;
+    const next = [...previous, { role: 'user', content: displayContent, attachment: bossAttachment ? { name: bossAttachment.name, type: bossAttachment.type, kind: bossAttachment.kind, previewUrl: bossAttachment.previewUrl } : null }];
+    setBossMessages(next); setBossDraft(''); setBossBusy(true); setBossError(''); setBossPlan(null);
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/boss/chat`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider, api_key: llm.key || '', model: llm.model || '', base_url: llm.base_url || '', message: message || displayContent,
+          attachments: bossAttachment ? [{ name: bossAttachment.name, type: bossAttachment.type, kind: bossAttachment.kind, data_url: bossAttachment.dataUrl }] : [],
+          history: previous.slice(-12).map(({ role, content }) => ({ role, content })) })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Boss konnte nicht antworten.');
+      setBossMessages(items => [...items, { role: 'assistant', content: data.reply, attachments: data.attachments || [], mediaAnalysis: data.media_analysis || [] }]);
+      if (bossAttachment?.kind === 'image') { setRef({ dataUrl: bossAttachment.dataUrl, name: bossAttachment.name }); setRefMode('style'); }
+      setBossAttachment(null); setBossMediaMenu(false);
+      if (data.workflow && data.workflow !== 'none') {
+        const visualContext = (data.media_analysis || []).map(a => `${a.name}: ${(a.frames || []).map(f => f.summary).join(' ')}`).join('\n');
+        const mediaPrompt = [data.category, message, visualContext ? `Visuelle Referenzanalyse:\n${visualContext}` : ''].filter(Boolean).join('\n\n').slice(0, 1900);
+        setBossMediaPrompt(mediaPrompt);
+        setBossPlan({ ...data, mediaPrompt, videoReferenceFrame: data.video_reference_frame_data_url || '' });
+      }
+    } catch (error) { setBossError(error.message || 'Verbindung fehlgeschlagen.'); }
+    finally { setBossBusy(false); }
+  };
+
+  const applyBossPlan = () => {
+    if (!bossPlan) return;
+    const target = ['factory', 'studio', 'content', 'story', 'game-assets', 'media'].includes(bossPlan.workflow) ? bossPlan.workflow : 'factory';
+    if (bossPlan.category?.trim()) setCategory(bossPlan.category.trim());
+    setTab(target); setBossPlan(null);
+  };
+
+  const executeBossPlan = () => {
+    if (!bossPlan || running || (bossPlan.workflow !== 'media' && !connected)) return;
+    const target = bossPlan.workflow;
+    const plannedCategory = bossPlan.category?.trim() || category;
+    if (target === 'media') {
+      let mediaCfg = {};
+      try { mediaCfg = JSON.parse(localStorage.getItem('agent-factory.media.v1') || '{}'); } catch { mediaCfg = {}; }
+      if (!mediaCfg.replicateKey?.trim()) {
+        setBossError('Für die direkte Videogenerierung fehlt der Replicate-Token. Öffne Audio & Video, hinterlege ihn einmal und starte den Boss-Auftrag erneut.');
+        setTab('media');
+        return;
+      }
+      const prompt = (bossPlan.mediaPrompt || plannedCategory).slice(0, 2000);
+      setBossBusy(true); setBossError('');
+      fetch(`${API_ORIGIN}/api/media/video`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: mediaCfg.replicateKey, prompt, model_slug: mediaCfg.videoModel || 'minimax/video-01', duration_seconds: Number(mediaCfg.duration || 5), reference_image_data_url: bossPlan.videoReferenceFrame || '' }) })
+        .then(async response => { const data = await response.json(); if (!response.ok) throw new Error(data.detail || 'Videogenerierung fehlgeschlagen.'); setBossMessages(items => [...items, { role: 'assistant', content: `Video fertig: ${data.filename || 'Videoclip'} (${data.model || 'Replicate'}).`, generatedMedia: `${API_ORIGIN}${data.url}` }]); setBossPlan(null); log('Boss', `Video erzeugt: ${data.filename || 'Videoclip'}`); })
+        .catch(error => setBossError(error.message || 'Videogenerierung fehlgeschlagen.'))
+        .finally(() => setBossBusy(false));
+      return;
+    }
+    if (!['factory', 'studio', 'content'].includes(target)) {
+      setCategory(plannedCategory);
+      setTab(target);
+      setBossPlan(null);
+      log('Boss', `Auftrag vorbereitet. Für „${target}“ öffne ich die Station; dort bitte die passende Aktion starten.`);
+      return;
+    }
+    if (!llm.key?.trim() && provider !== 'custom') {
+      setBossError(`Bitte hinterlege zuerst den API-Key für ${PROVIDERS.find(p => p[0] === provider)?.[1] || provider}.`);
+      return;
+    }
+    if (provider === 'custom' && (!llm.base_url?.trim() || !llm.model?.trim())) {
+      setBossError('Beim eigenen Anbieter fehlen Base-URL oder Modellname.');
+      return;
+    }
+    const studio = target === 'studio', content = target === 'content';
+    const chosenModules = content
+      ? CONTENT_MODULES.map(([k]) => k).filter(k => cModules[k])
+      : studio ? MODULES.map(([k]) => k).filter(k => modules[k]) : undefined;
+    if ((content || studio) && !chosenModules?.length) {
+      setBossError('Wähle in der passenden Station mindestens ein Modul aus, bevor du den Auftrag ausführst.');
+      setTab(target);
+      return;
+    }
+    if (content && cModules.thumbnails && !FORMAT_LIST.some(([k]) => formats[k])) {
+      setBossError('Wähle mindestens ein Thumbnail-Format in den Content-Einstellungen.'); setTab(target); return;
+    }
+    if (content && cModules.banners && !BANNER_LIST.some(([k]) => bannerTargets[k])) {
+      setBossError('Wähle mindestens ein Banner-Format in den Content-Einstellungen.'); setTab(target); return;
+    }
+    setBossError(''); setStations(fresh()); setRunning(true); setTab(target); setBossPlan(null);
+    const payload = {
+      action: content ? 'start_content' : studio ? 'start_studio' : 'start_production',
+      category: plannedCategory, provider, publish: false,
+      image_count: target === 'factory' ? count : variants,
+      modules: chosenModules,
+      formats: content ? FORMAT_LIST.map(([k]) => k).filter(k => formats[k]) : undefined,
+      banners: content ? BANNER_LIST.map(([k]) => k).filter(k => bannerTargets[k]) : undefined,
+      language: lang, hint, mockups: target === 'factory' && withMockups,
+      reference: ref ? { data_url: ref.dataUrl, name: ref.name, mode: refMode } : undefined,
+      api_key: llm.key || '', model: llm.model || '', base_url: llm.base_url || '',
+      image: { provider: imageProvider, ...imgCfg }, etsy: cfg.etsy,
+      shopify_enabled: false, shopify: cfg.shopify,
+    };
+    try {
+      wsRef.current.send(JSON.stringify(payload));
+      log('Boss', `Auftrag delegiert: ${plannedCategory} → ${target === 'factory' ? 'Wallpaper-Fabrik' : target === 'studio' ? 'Marketing-Studio' : 'Content-Studio'}. Externe Veröffentlichungen bleiben deaktiviert.`);
+    } catch (error) {
+      setRunning(false); setBossError(`Auftrag konnte nicht gestartet werden: ${error.message}`);
+    }
+  };
+
   const product = products.find(p => p.id === selectedId);
 
   return (
-    <div className="min-h-screen p-4 md:p-8">
-      <div className="max-w-6xl mx-auto">
-        <header className="flex flex-wrap items-end justify-between gap-4 mb-6">
+    <div className="a1-app min-h-screen p-4 md:p-8">
+      <GlobeBackground />
+      <div className="max-w-6xl mx-auto a1-content">
+        <header className="a1-header flex flex-wrap items-end justify-between gap-4 mb-6">
           <div>
-            <h1 className="display text-3xl font-bold">Agent Factory</h1>
-            <p className="text-sm text-stone-600 mt-1">Von der Nische zum Etsy-Entwurf, in drei Stationen.</p>
+            <div className="flex items-center gap-3"><span className="a1-mark">A1</span><h1 className="display text-3xl font-bold">A1 Factory</h1></div>
+            <p className="text-sm text-stone-600 mt-2">AI CREATION WORKSPACE <span className="a1-separator">/</span> Von der Idee zum Ergebnis.</p>
           </div>
-          <span className={`text-xs px-2 py-1 rounded ${connected ? 'bg-emerald-700 text-white' : 'bg-red-700 text-white'}`}>
-            {connected ? 'Verbunden' : 'Getrennt, verbinde neu…'}
-          </span>
+          <div className="a1-header-tools flex flex-wrap items-center gap-3">
+            <label className="a1-color-control" title="Freie Akzentfarbe auswählen">
+              <span className="a1-color-swatch" style={{ backgroundColor: accentColor }} />
+              <span className="a1-color-label">AKZENT</span>
+              <input aria-label="Akzentfarbe frei wählen" type="color" value={accentColor} onChange={e => setAccentColor(e.target.value)} />
+              <span className="a1-hex">{accentColor.toUpperCase()}</span>
+            </label>
+            <span className={`a1-connection text-xs px-2 py-1 ${connected ? 'bg-emerald-700 text-white' : 'bg-red-700 text-white'}`}>
+              <span className="a1-status-dot" />{connected ? 'Verbunden' : 'Verbindung wird aufgebaut'}
+            </span>
+          </div>
         </header>
 
         <div className="flex gap-2 mb-6" role="tablist">
-          {[['factory', 'Wallpaper-Fabrik'], ['studio', 'Marketing-Studio'], ['content', 'Content-Studio'], ['story', 'Storytelling'], ['game-assets', 'Game Assets'], ['media', 'Audio & Video']].map(([k, l]) => (
+          {[['boss', 'Boss-Chat'], ['factory', 'Wallpaper-Fabrik'], ['studio', 'Marketing-Studio'], ['content', 'Content-Studio'], ['story', 'Storytelling'], ['game-assets', 'Game Assets'], ['media', 'Audio & Video']].map(([k, l]) => (
             <button key={k} role="tab" aria-selected={tab === k} onClick={() => setTab(k)} disabled={running}
               className={`display font-bold px-4 py-2 rounded-t border-b-4 text-sm ${tab === k ? 'border-[#E8590C] bg-white' : 'border-transparent text-stone-600 hover:bg-[#EFEDE7]'}`}>{l}</button>
           ))}
         </div>
 
-        {tab === 'story' ? <StorytellingWorkspace apiOrigin={API_ORIGIN} /> : tab === 'game-assets' ? <GameAssetsWorkspace apiOrigin={API_ORIGIN} /> : tab === 'media' ? <AudioVideoWorkspace apiOrigin={API_ORIGIN} /> : <>
+        {tab === 'boss' ? <section className="bg-white border border-stone-400 rounded-lg p-4 md:p-6">
+          <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+            <div><h2 className="display text-2xl font-bold">Boss-Zentrale</h2><p className="text-sm text-stone-600 mt-1">Aufträge besprechen, Workflow planen und zur passenden Station wechseln.</p></div>
+            <span className="text-xs rounded bg-[#FFF4EC] border border-[#E8590C] px-2 py-1">KI: {PROVIDERS.find(p => p[0] === provider)?.[1] || provider}</span>
+          </div>
+          <div className="h-[min(52vh,480px)] min-h-64 overflow-y-auto border border-stone-300 rounded p-3 bg-[#F8F7F3] space-y-3" aria-live="polite">
+            {bossMessages.map((m, i) => <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}><div className={`max-w-[90%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm ${m.role === 'user' ? 'bg-stone-800 text-white' : 'bg-white border border-stone-300'}`}><p className="text-[11px] font-semibold mb-1 opacity-70">{m.role === 'user' ? 'Du' : 'Boss'}</p>{m.content}{m.generatedMedia && <video controls playsInline className="mt-2 max-h-80 w-full rounded border border-stone-300" src={m.generatedMedia}>Dein Browser unterstützt keine Videowiedergabe.</video>}{m.mediaAnalysis?.length > 0 && <div className="mt-3 space-y-2">{m.mediaAnalysis.map((analysis, ai) => <div key={`${analysis.name}-${ai}`} className="rounded border border-stone-300 bg-stone-50 p-2"><p className="font-semibold text-xs">Medienanalyse: {analysis.name}</p>{analysis.frames?.map((frame, fi) => <p key={`${frame.frame}-${fi}`} className="mt-1 text-xs text-stone-700"><span className="font-semibold">{frame.frame}:</span> {frame.summary}</p>)}</div>)}</div>}{m.attachment && <div className="mt-2 text-xs">{m.attachment.kind === 'image' ? <img src={m.attachment.previewUrl} alt={m.attachment.name} className="max-h-40 max-w-full rounded border border-stone-300" /> : <div className="rounded border border-stone-300 p-2">🎬 {m.attachment.name}</div>}<p className="mt-1 opacity-75">Anhang: {m.attachment.name}</p></div>}</div></div>)}
+            {bossBusy && <p className="text-sm text-stone-500 animate-pulse">Boss denkt nach…</p>}
+          </div>
+          {bossError && <p className="text-sm text-red-700 mt-2" role="alert">{bossError}</p>}
+          {bossPlan && <div className="mt-4 border border-[#E8590C] bg-[#FFF4EC] rounded p-3"><p className="font-semibold text-sm">Workflow vorgeschlagen: {({factory:'Wallpaper-Fabrik',studio:'Marketing-Studio',content:'Content-Studio',story:'Storytelling','game-assets':'Game Assets',media:'Audio & Video'})[bossPlan.workflow] || bossPlan.workflow}</p>{bossPlan.category && <p className="text-sm mt-1">Aufgabe: {bossPlan.category}</p>}{bossPlan.next_step && <p className="text-sm text-stone-700 mt-1">Nächster Schritt: {bossPlan.next_step}</p>}<div className="mt-3 flex flex-wrap gap-2"><button type="button" onClick={executeBossPlan} disabled={bossPlan.workflow === 'media' ? bossBusy : (running || !connected)} className="bg-[#E8590C] text-white font-semibold rounded px-4 py-2 text-sm hover:bg-orange-700 disabled:opacity-50">{['factory','studio','content'].includes(bossPlan.workflow) ? 'Auftrag jetzt ausführen' : bossPlan.workflow === 'media' ? 'Video direkt erzeugen' : 'Station öffnen'}</button><button type="button" onClick={applyBossPlan} className="border border-stone-400 bg-white text-stone-800 font-semibold rounded px-4 py-2 text-sm">Nur übernehmen</button></div><p className="text-xs text-stone-600 mt-2">Fabrik, Marketing und Content werden direkt an die vorhandenen Produktionspipelines übergeben. Bei Videoaufträgen nutzt der Boss die Medienanalyse als Prompt und übergibt beim Modell minimax/video-01 zusätzlich ein Referenz-Einzelbild. Die Generierung kann Guthaben bei Replicate verbrauchen. Veröffentlichungen bei Etsy/Shopify werden nicht automatisch ausgelöst.</p></div>}
+          <form onSubmit={sendBossMessage} className="mt-4 flex flex-col gap-2"><textarea value={bossDraft} onChange={e => setBossDraft(e.target.value)} rows={3} maxLength={6000} placeholder="Schreib oder sprich deinen Auftrag… Du kannst auch direkt ein Bild oder Video anhängen." className={`${field} flex-1 resize-y`} />
+            {bossAttachment && <div className="flex items-center gap-3 rounded border border-stone-300 bg-stone-50 p-3">{bossAttachment.kind === 'image' ? <img src={bossAttachment.previewUrl} alt="Vorschau" className="h-16 w-16 rounded object-cover" /> : <div className="flex h-16 w-16 items-center justify-center rounded bg-stone-200 text-2xl">🎬</div>}<div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{bossAttachment.name}</p><p className="text-xs text-stone-500">{bossAttachment.kind === 'image' ? 'Bildreferenz' : 'Videoreferenz'} · {(bossAttachment.size / 1024 / 1024).toFixed(1)} MB</p></div><button type="button" onClick={() => { URL.revokeObjectURL(bossAttachment.previewUrl); setBossAttachment(null); }} className="text-sm underline">Entfernen</button></div>}
+            <div className="flex flex-wrap gap-2"><div className="relative"><button type="button" onClick={() => setBossMediaMenu(v => !v)} aria-expanded={bossMediaMenu} className="font-semibold rounded px-4 py-3 border border-stone-400 bg-white text-stone-800 hover:bg-stone-100">＋ Medien hinzufügen ▾</button>{bossMediaMenu && <div className="absolute bottom-full left-0 z-20 mb-1 min-w-56 rounded border border-stone-300 bg-white p-1 shadow-lg"><button type="button" onClick={() => { if (bossFileInputRef.current) { bossFileInputRef.current.accept = 'image/*'; bossFileInputRef.current.click(); } setBossMediaMenu(false); }} className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-stone-100">🖼️ Bild als Referenz hinzufügen</button><button type="button" onClick={() => { if (bossFileInputRef.current) { bossFileInputRef.current.accept = 'video/*'; bossFileInputRef.current.click(); } setBossMediaMenu(false); }} className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-stone-100">🎬 Video als Referenz hinzufügen</button></div>}<input ref={bossFileInputRef} type="file" accept="image/*,video/*" onChange={onBossAttachment} className="hidden" /></div><button type="button" onClick={toggleSpeechInput} disabled={!speechSupported && !speechListening} aria-pressed={speechListening} className={`font-semibold rounded px-4 py-3 border disabled:opacity-50 ${speechListening ? 'bg-red-700 text-white border-red-700' : 'bg-white text-stone-800 border-stone-400 hover:bg-stone-100'}`}>{speechListening ? '■ Aufnahme stoppen' : '🎙️ Per Sprache eingeben'}</button><button type="submit" disabled={bossBusy || (!bossDraft.trim() && !bossAttachment)} className="bg-[#E8590C] text-white font-semibold rounded px-5 py-3 disabled:opacity-50">{bossBusy ? 'Denkt…' : 'An Boss senden'}</button></div>{speechListening && <p className="text-sm text-red-700" role="status">Ich höre zu … Sprich deinen Auftrag. Stoppe die Aufnahme, wenn du fertig bist.</p>}{!speechSupported && <p className="text-xs text-stone-500">Sprachsteuerung benötigt einen Browser mit Web Speech API, z. B. Chrome oder Edge, sowie Mikrofonfreigabe.</p>}<p className="text-xs text-stone-500">Bilder werden visuell analysiert und als Referenz für den nächsten Produktionsauftrag übernommen. Videos werden gespeichert und anhand von drei repräsentativen Einzelbildern visuell analysiert. Die Analyse fließt in die Workflow-Empfehlung ein; sie ist keine vollständige Einzelbild-für-Einzelbild-Prüfung. Maximal 12 MB pro Datei.</p></form>
+          <p className="text-xs text-stone-500 mt-2">Der Boss nutzt den oben ausgewählten KI-Anbieter und dessen gespeicherte Zugangsdaten. Er plant und empfiehlt; externe Veröffentlichungen werden nicht ohne deinen Start ausgelöst.</p>
+        </section> : tab === 'story' ? <StorytellingWorkspace apiOrigin={API_ORIGIN} /> : tab === 'game-assets' ? <GameAssetsWorkspace apiOrigin={API_ORIGIN} /> : tab === 'media' ? <AudioVideoWorkspace apiOrigin={API_ORIGIN} /> : <>
         <section className="bg-white border border-stone-400 rounded-lg mb-6">
           <button onClick={() => setShowSettings(v => !v)} aria-expanded={showSettings}
             className="w-full flex justify-between items-center px-4 py-3 text-left focus:outline focus:outline-2 focus:outline-[#E8590C]">
