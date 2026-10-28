@@ -1,4 +1,4 @@
-# Agent Factory – Bedienungsanleitung
+# A1 Factory – Bedienungsanleitung
 
 ## 1. Starten (macOS)
 
@@ -99,7 +99,7 @@ Im oberen Menü findest du **Audio & Video**. Die erste Integration enthält zwe
 3. Beschreibe die Szene, Bewegung und Kameraführung. Das Modell-Feld erwartet einen Modellnamen im Format `anbieter/modell`; voreingestellt ist `minimax/video-01`.
 4. Wähle eine Dauer zwischen 3 und 10 Sekunden und klicke **Video erzeugen**. Wenn das Modell erfolgreich fertig wird, erscheint der Clip im Player und kann als MP4 heruntergeladen werden.
 
-**Wichtig für Video:** Replicate-Modelle haben unterschiedliche Eingabeparameter. Diese erste Version sendet `prompt` und `duration`. Wenn ein Modell andere Felder verlangt oder keine Dauer unterstützt, zeigt Agent Factory einen Fehler des Anbieters an. Prüfe vor dem Start die Modellbeschreibung und Preise auf Replicate.
+**Wichtig für Video:** Replicate-Modelle haben unterschiedliche Eingabeparameter. Standardmäßig sendet A1 Factory `prompt` und `duration`. Bei `minimax/video-01` kann optional auch ein Referenzbild als erstes Videobild übergeben werden. Wenn ein anderes Modell andere Felder verlangt, zeigt A1 Factory einen Fehler des Anbieters an. Prüfe vor dem Start die Modellbeschreibung und Preise auf Replicate.
 
 ### Wo liegen die Dateien?
 
@@ -114,3 +114,12 @@ Generierte MP3- und MP4-Dateien werden im lokalen Backend unter `backend/output/
 - **Zeitüberschreitung:** Lange Videogenerierungen können länger als der aktuelle Request-Zeitraum dauern; prüfe den Modellstatus beim Anbieter und starte gegebenenfalls erneut.
 
 Die Audio- und Video-Endpunkte sind mit lokalen Validierungstests geprüft. Eine Live-Generierung wurde nicht durchgeführt, da dafür persönliche API-Keys und ein kostenpflichtiger bzw. verfügbarer Anbieterzugang nötig sind.
+
+
+## Boss-Zentrale und Auftragsdelegation
+
+Beim Öffnen startet A1 Factory direkt im **Boss-Chat**. Du kannst deinen Auftrag eintippen oder über **Per Sprache eingeben** diktieren (Chrome/Edge, Mikrofonfreigabe erforderlich). Im Menü **Medien hinzufügen** kannst du ein Bild oder Video anhängen. Das Backend speichert die Datei und analysiert Bilder über ein Vision-fähiges Modell des ausgewählten Text-KI-Anbieters. Videos werden mit `ffmpeg`/`ffprobe` an drei repräsentativen Zeitpunkten in Einzelbilder zerlegt und diese werden visuell analysiert. Deshalb müssen `ffmpeg` und `ffprobe` auf dem Backend-System installiert sein. Wähle ein Modell mit Bildverständnis; falls das Modell keine Bildanalyse unterstützt, zeigt der Boss einen verständlichen Fehler an.
+
+Wenn der Boss einen Workflow vorschlägt, kannst du **Auftrag jetzt ausführen** wählen. Wallpaper-Fabrik, Marketing-Studio und Content-Studio werden direkt über die bestehende WebSocket-Verbindung gestartet. Bei einem Video-Workflow erzeugt **Video direkt erzeugen** mit dem gespeicherten Replicate-Token einen Clip anhand der Medienanalyse; bei `minimax/video-01` wird zusätzlich das erste repräsentative Einzelbild als visuelle Vorlage übergeben. Das bearbeitet nicht das Originalvideo framegenau, sondern erzeugt einen neuen Clip, der sich an Analyse und Referenzbild orientiert. Videogenerierung kann Guthaben verbrauchen.
+
+Der Boss löst keine externe Veröffentlichung automatisch aus: Etsy- und Shopify-Veröffentlichungen bleiben bei einer Boss-Delegation deaktiviert. Für Storytelling und Game Assets öffnet **Station öffnen** die jeweilige Station; dort muss die individuelle Generierung noch bestätigt werden. Für Text- und Produktions-Workflows müssen die jeweiligen KI- und Bildanbieter-Zugangsdaten hinterlegt sein.

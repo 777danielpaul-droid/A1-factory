@@ -1,4 +1,4 @@
-import asyncio, json, os, re, uuid
+import asyncio, base64, json, os, re, uuid, subprocess, tempfile
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
@@ -25,7 +25,7 @@ from services.media_generation import generate_speech, generate_video  # noqa: E
 BASE = Path(__file__).resolve().parent
 (BASE / "output" / "assets").mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Agent Factory (BYOK)")
+app = FastAPI(title="A1 Factory (BYOK)")
 app.add_middleware(CORSMiddleware, allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
                    allow_methods=["*"], allow_headers=["*"])
 app.mount("/static/assets", StaticFiles(directory=BASE / "output" / "assets"), name="assets")
@@ -86,6 +86,7 @@ class VideoRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=2000)
     model_slug: str = Field(default="minimax/video-01", min_length=5, max_length=180)
     duration_seconds: int = Field(default=5, ge=3, le=10)
+    reference_image_data_url: str = Field(default="", max_length=500_000)
 
 
 @app.post("/api/media/audio")
@@ -103,7 +104,7 @@ async def api_generate_audio(req: SpeechRequest):
 @app.post("/api/media/video")
 async def api_generate_video(req: VideoRequest):
     try:
-        return await generate_video(api_key=req.api_key, prompt=req.prompt, model_slug=req.model_slug, duration_seconds=req.duration_seconds)
+        return await generate_video(api_key=req.api_key, prompt=req.prompt, model_slug=req.model_slug, duration_seconds=req.duration_seconds, reference_image_data_url=req.reference_image_data_url)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except RuntimeError as exc:
@@ -360,6 +361,142 @@ async def story_create(req: StoryInput):
         panels.append(panel)
     story={"title":req.title.strip(),"premise":req.premise.strip(),"style":req.style,"language":req.language,"panel_count":req.panel_count,"character_ids":req.character_ids,"characters":[{k:v for k,v in c.items() if k != "reference_image_data_url"} for c in chars],"panels":panels,"reference_used":bool(reference)}
     return save_story(story)
+
+
+class BossChatRequest(BaseModel):
+    provider: str = Field(min_length=1, max_length=40)
+    api_key: str = Field(default="", max_length=2000)
+    model: str = Field(default="", max_length=200)
+    base_url: str = Field(default="", max_length=1000)
+    message: str = Field(min_length=1, max_length=6000)
+    history: list[dict] = Field(default_factory=list, max_length=20)
+    attachments: list[dict] = Field(default_factory=list, max_length=3)
+
+
+@app.post("/api/boss/chat")
+async def boss_chat(req: BossChatRequest):
+    """Boss-Chat: antwortet und schlägt einen passenden vorhandenen Workflow vor."""
+    provider = req.provider.strip().lower()
+    if provider not in PROVIDERS:
+        raise HTTPException(422, "Unbekannter KI-Anbieter.")
+    if provider != "custom" and not req.api_key.strip():
+        raise HTTPException(422, f"Für {provider} fehlt der API-Key.")
+    if provider == "custom" and (not req.base_url.startswith(("http://", "https://")) or not req.model.strip()):
+        raise HTTPException(422, "Beim eigenen Anbieter werden Base-URL und Modellname benötigt.")
+    history = []
+    for item in req.history[-12:]:
+        role = item.get("role")
+        content = str(item.get("content", ""))[:3000]
+        if role in ("user", "assistant") and content:
+            history.append({"role": role, "content": content})
+    saved_attachments = []
+    attachment_notes = []
+    media_analysis = []
+    video_reference_frame_data_url = ""
+    attachment_dir = BASE / "output" / "assets" / "boss-attachments"
+    attachment_dir.mkdir(parents=True, exist_ok=True)
+    for item in req.attachments[:3]:
+        name = Path(str(item.get("name", "referenz"))).name[:160]
+        kind = str(item.get("kind", ""))
+        mime = str(item.get("type", "")).lower()
+        data_url = str(item.get("data_url", ""))
+        if kind not in {"image", "video"} or not ((kind == "image" and mime.startswith("image/")) or (kind == "video" and mime.startswith("video/"))):
+            raise HTTPException(422, "Anhang muss ein Bild oder Video sein.")
+        match = re.fullmatch(r"data:([a-zA-Z0-9.+/-]+);base64,([A-Za-z0-9+/=\r\n]+)", data_url)
+        if not match or match.group(1).lower() != mime:
+            raise HTTPException(422, "Anhang hat ein ungültiges Dateiformat.")
+        try:
+            raw = base64.b64decode(match.group(2), validate=True)
+        except Exception as exc:
+            raise HTTPException(422, "Anhang konnte nicht dekodiert werden.") from exc
+        if not raw or len(raw) > 12 * 1024 * 1024:
+            raise HTTPException(413, "Anhänge dürfen maximal 12 MB groß sein.")
+        ext = Path(name).suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
+            ext = ".jpg" if mime == "image/jpeg" else ".png" if mime == "image/png" else ".webp" if mime == "image/webp" else ".mp4" if mime == "video/mp4" else ".webm" if mime == "video/webm" else ".bin"
+        file_name = f"{uuid.uuid4().hex}{ext}"
+        destination = attachment_dir / file_name
+        destination.write_bytes(raw)
+        public_url = f"/static/assets/boss-attachments/{file_name}"
+        saved_attachments.append({"name": name, "kind": kind, "type": mime, "url": public_url, "size": len(raw)})
+        attachment_note = {"name": name, "kind": kind, "type": mime, "stored_reference": public_url, "size_bytes": len(raw)}
+        attachment_notes.append(attachment_note)
+
+        # Analyse media, not just save it. Images go to the selected vision-capable LLM.
+        # Videos are sampled into representative frames with ffmpeg, then those frames are analysed.
+        try:
+            vision = LLMGateway()
+            frames = []
+            if kind == "image":
+                try:
+                    from PIL import Image
+                    from io import BytesIO
+                    im = Image.open(BytesIO(raw)).convert("RGB")
+                    im.thumbnail((1024, 1024))
+                    buff = BytesIO(); im.save(buff, format="JPEG", quality=85)
+                    image_b64 = base64.b64encode(buff.getvalue()).decode("ascii")
+                    frames.append({"label": "Bild", "mime": "image/jpeg", "b64": image_b64})
+                    ref_im = im.copy(); ref_im.thumbnail((512, 512)); ref_buff = BytesIO(); ref_im.save(ref_buff, format="JPEG", quality=70)
+                    video_reference_frame_data_url = "data:image/jpeg;base64," + base64.b64encode(ref_buff.getvalue()).decode("ascii")
+                except Exception as exc:
+                    raise ValueError("Bild konnte nicht gelesen werden.") from exc
+            else:
+                with tempfile.TemporaryDirectory(prefix="a1-boss-video-") as temp_dir:
+                    source = Path(temp_dir) / ("input" + (ext if ext != ".bin" else ".mp4"))
+                    source.write_bytes(raw)
+                    # Take three frames across the clip; ffmpeg is shipped/installed with the app host.
+                    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(source)], capture_output=True, text=True, timeout=10, check=True)
+                    try: duration = max(0.1, float(probe.stdout.strip()))
+                    except Exception: duration = 1.0
+                    for idx, fraction in enumerate((0.1, 0.5, 0.9), start=1):
+                        frame_path = Path(temp_dir) / f"frame-{idx}.jpg"
+                        # Analyse three representative points across the clip.
+                        timestamp = max(0.0, duration * fraction)
+                        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", str(timestamp), "-i", str(source), "-frames:v", "1", "-vf", "scale=1024:-2", "-y", str(frame_path)], capture_output=True, text=True, timeout=20, check=True)
+                        if frame_path.exists() and frame_path.stat().st_size:
+                            frame_b64 = base64.b64encode(frame_path.read_bytes()).decode("ascii")
+                            frames.append({"label": f"Videoframe {idx} ({timestamp:.1f}s)", "mime": "image/jpeg", "b64": frame_b64})
+                            if idx == 1:
+                                from PIL import Image
+                                from io import BytesIO
+                                ref_im = Image.open(frame_path).convert("RGB"); ref_im.thumbnail((512, 512)); ref_buff = BytesIO(); ref_im.save(ref_buff, format="JPEG", quality=70)
+                                video_reference_frame_data_url = "data:image/jpeg;base64," + base64.b64encode(ref_buff.getvalue()).decode("ascii")
+                    if not frames:
+                        raise ValueError("Aus dem Video konnten keine Einzelbilder gelesen werden.")
+            frame_summaries = []
+            for frame in frames:
+                prompt = ("Analysiere dieses Bild als visuelle Referenz für eine Kreativproduktion. Beschreibe knapp Motiv, Personen/Objekte, Bildaufbau, Farben, Stil, Licht, Text im Bild und wichtige Details. Erfinde keine nicht sichtbaren Fakten. Antworte auf Deutsch.")
+                summary = await vision.generate_text(provider, req.api_key.strip(), "Du bist ein präziser visueller Analyse-Assistent.", prompt, req.model.strip() or None, req.base_url.strip() or None, image={"mime": frame["mime"], "b64": frame["b64"]})
+                frame_summaries.append({"frame": frame["label"], "summary": summary[:1800]})
+            media_analysis.append({"name": name, "kind": kind, "frames": frame_summaries})
+            attachment_note["visual_analysis"] = frame_summaries
+        except FileNotFoundError as exc:
+            raise HTTPException(500, "Für die Videoanalyse fehlt ffmpeg/ffprobe auf dem Backend-System.") from exc
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+            raise HTTPException(422, f"Die Mediendatei {name} konnte nicht analysiert werden. Prüfe das Format und versuche es erneut.") from exc
+        except LLMError as exc:
+            raise HTTPException(502, f"Die Medienanalyse ist fehlgeschlagen: {str(exc)[:350]}") from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    user_prompt = json.dumps({"conversation": history, "new_message": req.message.strip(), "attached_references": attachment_notes}, ensure_ascii=False)
+    system = """Du bist Boss, der koordinierende Leiter der A1 Factory. Antworte auf Deutsch, knapp und konkret. Wenn visuelle Analysen zu Anhängen vorliegen, verwende sie als tatsächlichen Kontext für Empfehlungen und Produktionsprompts. Erkläre bei Videos, dass du repräsentative Frames analysiert hast, nicht jedes Einzelbild. Die verfügbaren Workflows sind: factory (Scout findet Produktidee, Designer erzeugt Motiv, Publisher schreibt Listing und kann Entwurf anlegen), studio (Merch-/Brand-/Mockup-Design), content (Thumbnails, Streamer-Paket, Banner), story (Storytelling), game-assets (Spielgrafiken), media (Audio/Video). Du kannst planen und passende Workflows vorschlagen, aber behaupte niemals, dass Agenten bereits ausgeführt wurden oder Dateien erstellt wurden. Gib ausschließlich valides JSON zurück mit genau diesen Feldern: reply (String), workflow (factory|studio|content|story|game-assets|media|none), category (String, kurze Aufgaben-/Themenbeschreibung), next_step (String, kurze nächste Aktion). Wenn keine Produktion angefragt ist, workflow=none. Wenn unklar, stelle eine kurze Rückfrage und workflow=none. Keine externen Aktionen ohne Bestätigung."""
+    try:
+        result = await LLMGateway().generate_json(provider, req.api_key.strip(), system, user_prompt,
+                                                  req.model.strip() or None, req.base_url.strip() or None, retries=1)
+    except LLMError as exc:
+        msg = str(exc)
+        raise HTTPException(502, msg[:500]) from exc
+    workflow = result.get("workflow", "none")
+    if workflow not in {"factory", "studio", "content", "story", "game-assets", "media", "none"}:
+        workflow = "none"
+    reply = str(result.get("reply", "Ich konnte keine Antwort erzeugen."))[:5000]
+    if saved_attachments:
+        names = ", ".join(item["name"] for item in saved_attachments)
+        reply += f"\n\nAngehängte Referenz(en) gespeichert: {names}."
+    return {"reply": reply, "attachments": saved_attachments, "media_analysis": media_analysis,
+            "video_reference_frame_data_url": video_reference_frame_data_url,
+            "workflow": workflow, "category": str(result.get("category", ""))[:300],
+            "next_step": str(result.get("next_step", ""))[:500]}
 
 
 class ModelsReq(BaseModel):

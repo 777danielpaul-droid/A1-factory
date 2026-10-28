@@ -1,4 +1,4 @@
-# Agent Factory
+# A1 Factory
 
 Scout (Idee) → Designer (Bild via Stability) → Publisher (Listing + Etsy-Entwurf). LLM-Anbieter pro Lauf wählbar.
 
@@ -93,4 +93,4 @@ Eine ausführlichere deutsche Schritt-für-Schritt-Anleitung steht in [`BEDIENUN
 
 ## Audio & Video (neue Werkstatt)
 
-Im Frontend-Menü **Audio & Video** sind optionale BYOK-Integrationen für Text-zu-Sprache über ElevenLabs und Text-zu-Video über Replicate verfügbar. Die API-Schlüssel werden pro Anfrage ans Backend übergeben; generierte MP3/MP4-Dateien werden lokal unter `backend/output/assets/` gespeichert. Die Video-Integration sendet `prompt` und `duration` an das gewählte Replicate-Modell; prüfe dessen Modellkarte und Kosten, da nicht jedes Modell dieselben Eingaben unterstützt. Details und Setup: `BEDIENUNGSANLEITUNG.md`. Live-Provider wurden ohne Nutzer-API-Keys nicht getestet.
+Im Frontend-Menü **Audio & Video** sind optionale BYOK-Integrationen für Text-zu-Sprache über ElevenLabs und Text-zu-Video über Replicate verfügbar. Der Boss-Chat kann Bilder analysieren und Videos mit `ffmpeg`/`ffprobe` über drei repräsentative Frames zusammenfassen. Bei der direkten Videogenerierung wird für `minimax/video-01` zusätzlich das Referenz-Einzelbild übergeben; andere Replicate-Modelle erhalten nur Prompt und Dauer. Die API-Schlüssel werden nur für Anfragen verwendet; generierte MP3/MP4-Dateien werden lokal unter `backend/output/assets/` gespeichert. Für Vision braucht man ein bildfähiges LLM-Modell. Live-Provider wurden ohne Nutzer-API-Keys nicht getestet.
