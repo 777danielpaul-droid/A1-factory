@@ -1,0 +1,707 @@
+import asyncio, base64, json, os, re, uuid, subprocess, tempfile
+from pathlib import Path
+from dotenv import load_dotenv
+import httpx
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+load_dotenv()  # optional; es werden keine API-Keys aus Dateien gelesen
+from pipeline import AgentFactoryPipeline  # noqa: E402
+from studio_pipeline import StudioPipeline  # noqa: E402
+from content_pipeline import ContentPipeline  # noqa: E402
+from services.content_render import BANNERS, FORMATS  # noqa: E402
+from services.llm_gateway import PROVIDERS, LLMError, LLMGateway  # noqa: E402
+from services.shopify_api import SHOP_RE  # noqa: E402
+from services.image_generator import IMAGE_PROVIDERS, IMG2IMG, REQUIRED  # noqa: E402
+from product_store import init_db, save_product, list_products, get_product, update_product, delete_product  # noqa: E402
+from story_store import init_story_db, list_characters, get_character, save_character, delete_character, list_stories, get_story, save_story, delete_story  # noqa: E402
+from game_asset_store import init_game_asset_db, save_game_asset, list_game_assets, delete_game_asset  # noqa: E402
+from services.pixellab import PixelLabClient, PixelLabError  # noqa: E402
+
+from services.media_generation import generate_speech, generate_video, generate_sound_effect, compose_video_audio  # noqa: E402
+
+BASE = Path(__file__).resolve().parent
+(BASE / "output" / "assets").mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="A1 Factory (BYOK)")
+app.add_middleware(CORSMiddleware, allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+                   allow_methods=["*"], allow_headers=["*"])
+app.mount("/static/assets", StaticFiles(directory=BASE / "output" / "assets"), name="assets")
+init_db()
+init_story_db()
+init_game_asset_db()
+
+REF_RE = re.compile(r"^data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)$")
+MODULES = ["merch", "brand", "mockups"]
+CONTENT_MODULES = ["thumbnails", "streamer", "banners"]
+SHOPIFY_FIELDS = ["shop", "access_token", "client_id", "client_secret", "api_version"]
+ETSY_FIELDS = ["api_key", "shop_id", "taxonomy_id", "access_token", "refresh_token"]
+
+
+def parse_reference_data_url(data_url: str):
+    """Validate and normalize a small user-supplied image reference."""
+    if not data_url:
+        return None
+    match = REF_RE.match(data_url)
+    if not match or len(data_url) > 8_000_000:
+        raise HTTPException(422, "Referenzbild ungültig oder zu groß. Bitte PNG, JPEG oder WebP bis ca. 6 MB verwenden.")
+    return {"mime": match.group(1), "b64": re.sub(r"\s", "", match.group(2))}
+
+
+class Session:
+    """Eine Browser-Verbindung. Ergebnisse und Tokens gehen nur an diese Verbindung."""
+    def __init__(self, ws: WebSocket):
+        self.ws, self.running = ws, False
+
+    async def send(self, type_: str, data: dict):
+        try:
+            if type_ == "PRODUCT_CREATED":
+                try:
+                    data = save_product(data)
+                except Exception as exc:
+                    await self.ws.send_text(json.dumps({"type": "RUN_FAILED", "data": {
+                        "stage": "database", "error": f"Produkt konnte nicht gespeichert werden: {str(exc)[:200]}"}}))
+                    return
+            await self.ws.send_text(json.dumps({"type": type_, "data": data}))
+        except Exception:
+            pass
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "providers": PROVIDERS, "database": "sqlite"}
+
+
+class SpeechRequest(BaseModel):
+    api_key: str = Field(min_length=1, max_length=500)
+    text: str = Field(min_length=1, max_length=5000)
+    voice_id: str = Field(default="JBFqnCBsd6RMkjVDRZzb", min_length=3, max_length=100)
+    model_id: str = Field(default="eleven_multilingual_v2", max_length=100)
+
+
+class VideoRequest(BaseModel):
+    api_key: str = Field(min_length=1, max_length=500)
+    prompt: str = Field(min_length=1, max_length=2000)
+    model_slug: str = Field(default="minimax/video-01", min_length=5, max_length=180)
+    duration_seconds: int = Field(default=5, ge=3, le=10)
+    reference_image_data_url: str = Field(default="", max_length=500_000)
+
+
+@app.post("/api/media/audio")
+async def api_generate_audio(req: SpeechRequest):
+    try:
+        return await generate_speech(api_key=req.api_key, text=req.text, voice_id=req.voice_id, model_id=req.model_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "Zeitüberschreitung beim Audioanbieter. Versuch es erneut.") from exc
+
+
+@app.post("/api/media/video")
+async def api_generate_video(req: VideoRequest):
+    try:
+        return await generate_video(api_key=req.api_key, prompt=req.prompt, model_slug=req.model_slug, duration_seconds=req.duration_seconds, reference_image_data_url=req.reference_image_data_url)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "Videogenerierung dauert zu lange. Prüfe das Modell bei Replicate und versuche es erneut.") from exc
+
+
+class SoundEffectRequest(BaseModel):
+    api_key: str = Field(min_length=1, max_length=500)
+    prompt: str = Field(min_length=1, max_length=1000)
+    duration_seconds: float = Field(default=5, ge=0.5, le=22)
+
+
+@app.post("/api/media/sound-effects")
+async def api_generate_sound_effect(req: SoundEffectRequest):
+    try:
+        return await generate_sound_effect(api_key=req.api_key, prompt=req.prompt, duration_seconds=req.duration_seconds)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "Soundeffekt-Generierung dauerte zu lange.") from exc
+
+
+class ComposeMediaRequest(BaseModel):
+    video_filename: str = Field(min_length=1, max_length=100)
+    audio_filename: str = Field(min_length=1, max_length=100)
+    audio_volume: float = Field(default=1.0, ge=0, le=2)
+
+
+@app.post("/api/media/compose")
+def api_compose_media(req: ComposeMediaRequest):
+    try:
+        return compose_video_audio(video_filename=req.video_filename, audio_filename=req.audio_filename, audio_volume=req.audio_volume)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+MEDIA_EXTENSIONS = {
+    ".mp4": "video", ".webm": "video", ".mov": "video", ".m4v": "video",
+    ".mp3": "audio", ".wav": "audio", ".m4a": "audio", ".aac": "audio", ".ogg": "audio", ".flac": "audio",
+    ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image", ".gif": "image",
+}
+
+
+@app.get("/api/media/library")
+def api_media_library():
+    """List generated media files stored in output/assets, newest first."""
+    assets_dir = (BASE / "output" / "assets").resolve()
+    items = []
+    for path in assets_dir.iterdir():
+        if not path.is_file() or path.is_symlink() or path.suffix.lower() not in MEDIA_EXTENSIONS:
+            continue
+        stat = path.stat()
+        items.append({
+            "filename": path.name,
+            "kind": MEDIA_EXTENSIONS[path.suffix.lower()],
+            "url": f"/static/assets/{path.name}",
+            "bytes": stat.st_size,
+            "modified_at": stat.st_mtime,
+        })
+    items.sort(key=lambda item: item["modified_at"], reverse=True)
+    return {"items": items, "count": len(items), "total_bytes": sum(item["bytes"] for item in items)}
+
+
+@app.delete("/api/media/library/{filename}")
+def api_delete_media(filename: str):
+    """Delete one generated media file; never accepts paths or non-media files."""
+    if filename in {".", ".."} or Path(filename).name != filename or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "Ungültiger Dateiname.")
+    path = BASE / "output" / "assets" / filename
+    if path.is_symlink() or not path.is_file() or path.suffix.lower() not in MEDIA_EXTENSIONS:
+        raise HTTPException(404, "Mediendatei nicht gefunden.")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(500, "Datei konnte nicht gelöscht werden.") from exc
+    return {"deleted": filename}
+
+
+class ProductCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    description: str = Field(default="", max_length=20000)
+    price: float = Field(default=0, ge=0, le=1000000)
+    niche: str = Field(default="", max_length=120)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+
+
+class ProductUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    description: str | None = Field(default=None, max_length=20000)
+    price: float | None = Field(default=None, ge=0, le=1000000)
+    niche: str | None = Field(default=None, max_length=120)
+    tags: list[str] | None = Field(default=None, max_length=50)
+
+
+@app.get("/api/products")
+def api_list_products():
+    return {"products": list_products()}
+
+
+@app.post("/api/products", status_code=201)
+def api_create_product(req: ProductCreate):
+    payload = req.model_dump()
+    payload["title"] = payload["title"].strip()
+    if not payload["title"]:
+        raise HTTPException(422, "Der Titel darf nicht leer sein.")
+    payload["tags"] = [str(tag).strip()[:100] for tag in payload["tags"] if str(tag).strip()][:50]
+    payload.update({"id": str(uuid.uuid4()), "provider": "manual", "image_url": None, "image_urls": [], "mockup_urls": []})
+    return save_product(payload)
+
+
+@app.get("/api/products/{product_id}")
+def api_get_product(product_id: str):
+    try:
+        product = get_product(product_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if product is None:
+        raise HTTPException(404, "Produkt nicht gefunden.")
+    return product
+
+
+@app.put("/api/products/{product_id}")
+def api_update_product(product_id: str, req: ProductUpdate):
+    patch = req.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(400, "Keine Änderungen übermittelt.")
+    for key, value in patch.items():
+        if value is None:
+            raise HTTPException(422, f"Das Feld {key} darf nicht null sein.")
+    if "title" in patch:
+        patch["title"] = patch["title"].strip()
+        if not patch["title"]:
+            raise HTTPException(422, "Der Titel darf nicht leer sein.")
+    if "tags" in patch and patch["tags"] is not None:
+        patch["tags"] = [str(tag).strip()[:100] for tag in patch["tags"] if str(tag).strip()][:50]
+    try:
+        product = update_product(product_id, patch)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if product is None:
+        raise HTTPException(404, "Produkt nicht gefunden.")
+    return product
+
+
+@app.delete("/api/products/{product_id}")
+def api_delete_product(product_id: str):
+    try:
+        deleted = delete_product(product_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not deleted:
+        raise HTTPException(404, "Produkt nicht gefunden.")
+    return {"ok": True, "id": product_id}
+
+
+class CharacterInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=4000)
+    appearance: str = Field(default="", max_length=4000)
+    style: str = Field(default="anime", max_length=120)
+    reference_prompt: str = Field(default="", max_length=3000)
+    reference_image_data_url: str = Field(default="", max_length=8_000_000)
+
+class StoryInput(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    premise: str = Field(min_length=1, max_length=5000)
+    style: str = Field(default="webtoon, clean line art", max_length=500)
+    language: str = Field(default="Deutsch", max_length=40)
+    panel_count: int = Field(default=4, ge=1, le=12)
+    character_ids: list[str] = Field(default_factory=list, max_length=12)
+    generate_images: bool = False
+    image: dict = Field(default_factory=dict)
+    reference_data_url: str = Field(default="", max_length=8_000_000)
+
+class GameAssetInput(BaseModel):
+    api_key: str = Field(min_length=1, max_length=1000)
+    name: str = Field(min_length=1, max_length=160)
+    prompt: str = Field(min_length=1, max_length=2000)
+    asset_type: str = Field(default="sprite", max_length=40)
+    width: int = Field(default=128, ge=16, le=768)
+    height: int = Field(default=128, ge=16, le=768)
+    transparent: bool = True
+    seed: int | None = Field(default=None, ge=0, le=2147483647)
+    reference_data_url: str = Field(default="", max_length=8_000_000)
+
+
+@app.get("/api/game-assets")
+def game_assets_list():
+    return {"assets": list_game_assets()}
+
+
+@app.post("/api/game-assets/generate", status_code=201)
+async def game_asset_generate(req: GameAssetInput):
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(422, "Bitte einen Asset-Namen eingeben.")
+    reference = parse_reference_data_url(req.reference_data_url)
+    try:
+        path = await PixelLabClient(req.api_key).generate(req.prompt, req.width, req.height, req.transparent, req.seed, reference=reference)
+    except PixelLabError as exc:
+        message = str(exc)
+        status = 502
+        if "API-Key" in message: status = 401
+        elif "Guthaben/Credits" in message: status = 402
+        elif "Limit erreicht" in message: status = 429
+        raise HTTPException(status, message) from exc
+    item = save_game_asset({"name": name, "prompt": req.prompt.strip(), "asset_type": req.asset_type,
+        "width": req.width, "height": req.height, "transparent": req.transparent, "provider": "pixellab", "reference_used": bool(reference),
+        "image_url": "/static/assets/" + path.name})
+    return item
+
+
+@app.delete("/api/game-assets/{asset_id}")
+def game_asset_delete(asset_id: str):
+    image_url = delete_game_asset(asset_id)
+    if not image_url:
+        raise HTTPException(404, "Game-Asset nicht gefunden.")
+    filename = Path(image_url).name
+    path = (BASE / "output" / "assets" / filename).resolve()
+    assets_root = (BASE / "output" / "assets").resolve()
+    if path.parent == assets_root and path.name.startswith("pixellab_") and path.exists():
+        path.unlink()
+    return {"ok": True, "id": asset_id}
+
+
+@app.get("/api/story/characters")
+def story_characters_list():
+    return {"characters": list_characters()}
+
+@app.post("/api/story/characters", status_code=201)
+def story_character_create(req: CharacterInput):
+    data=req.model_dump(); data["name"]=data["name"].strip()
+    if not data["name"]: raise HTTPException(422, "Charaktername darf nicht leer sein.")
+    return save_character(data)
+
+@app.put("/api/story/characters/{character_id}")
+def story_character_update(character_id: str, req: CharacterInput):
+    if not get_character(character_id): raise HTTPException(404, "Charakter nicht gefunden.")
+    existing=get_character(character_id)
+    data={**existing, **req.model_dump(), "id":character_id}; data["name"]=data["name"].strip()
+    if not data["name"]: raise HTTPException(422, "Charaktername darf nicht leer sein.")
+    return save_character(data)
+
+@app.delete("/api/story/characters/{character_id}")
+def story_character_delete(character_id: str):
+    if not delete_character(character_id): raise HTTPException(404, "Charakter nicht gefunden.")
+    return {"ok":True,"id":character_id}
+
+@app.post("/api/story/characters/{character_id}/portraits")
+async def story_character_portraits(character_id: str, payload: dict):
+    char=get_character(character_id)
+    if not char: raise HTTPException(404, "Charakter nicht gefunden.")
+    cfg=dict(payload.get("image") or {})
+    provider=str(cfg.get("provider", "placeholder")).lower()
+    if provider not in IMAGE_PROVIDERS: raise HTTPException(422, "Unbekannter Bildanbieter.")
+    missing=[f for f in REQUIRED[provider] if not str(cfg.get(f, "")).strip()]
+    if missing: raise HTTPException(422, "Bildanbieter benötigt: "+", ".join(missing))
+    from services.image_generator import ImageGeneratorService
+    reference = parse_reference_data_url(str(payload.get("reference_data_url") or char.get("reference_image_data_url") or ""))
+    if reference and provider not in ("gemini", "openai", "local"):
+        raise HTTPException(422, "Für eine echte Bildvorlage wähle Gemini, OpenAI Bilder oder die lokale Stable-Diffusion-WebUI.")
+    service=ImageGeneratorService(); portraits=dict(char.get("portraits") or {}); errors={}
+    for emotion in ("neutral", "angry", "happy", "surprised"):
+        prompt=(f"{char.get('style','anime')} character portrait sheet, single head-and-shoulders portrait, same exact character identity. "
+                f"Character name: {char['name']}. Appearance: {char.get('appearance','')}. Personality: {char.get('description','')}. "
+                f"Continuity rules: {char.get('reference_prompt','')}. Facial expression only: {emotion}. Keep hairstyle, eye color, clothing and proportions unchanged. "
+                "Centered bust portrait, plain simple background, no text, no labels, high-quality game dialogue sprite.")
+        try:
+            path=await service.generate_asset(cfg, prompt, negative_prompt="different character, changed hairstyle, changed clothes, text, watermark, extra face", reference=reference)
+            portraits[emotion]="/static/assets/"+path.name
+        except Exception as exc:
+            errors[emotion]=str(exc)[:240]
+    char["portraits"]=portraits
+    char["portrait_errors"]=errors
+    saved=save_character(char)
+    return {"character":saved,"errors":errors}
+
+
+@app.get("/api/story/stories")
+def story_list(): return {"stories":list_stories()}
+
+@app.get("/api/story/stories/{story_id}")
+def story_get(story_id: str):
+    item=get_story(story_id)
+    if not item: raise HTTPException(404,"Geschichte nicht gefunden.")
+    return item
+
+@app.delete("/api/story/stories/{story_id}")
+def story_delete(story_id: str):
+    if not delete_story(story_id): raise HTTPException(404,"Geschichte nicht gefunden.")
+    return {"ok":True,"id":story_id}
+
+@app.post("/api/story/stories", status_code=201)
+async def story_create(req: StoryInput):
+    chars=[]
+    for ident in req.character_ids:
+        char=get_character(ident)
+        if not char: raise HTTPException(422, f"Unbekannter Charakter: {ident}")
+        chars.append(char)
+    # Build beat-by-beat prompts with a fixed character/style bible to encourage continuity.
+    beats=[x.strip() for x in re.split(r"(?<=[.!?])\s+|\n+",req.premise.strip()) if x.strip()]
+    if not beats: beats=[req.premise.strip()]
+    reference = parse_reference_data_url(req.reference_data_url or next((str(c.get("reference_image_data_url") or "") for c in chars if c.get("reference_image_data_url")), ""))
+    if reference and req.generate_images and str((req.image or {}).get("provider", "placeholder")).lower() not in ("gemini", "openai", "local"):
+        raise HTTPException(422, "Für eine echte Bildvorlage wähle Gemini, OpenAI Bilder oder die lokale Stable-Diffusion-WebUI.")
+    panels=[]
+    for i in range(req.panel_count):
+        beat=beats[min(i, len(beats)-1)] if len(beats)>=req.panel_count else (beats[i] if i<len(beats) else f"Fortsetzung der Handlung: {req.premise.strip()}")
+        char_bible="; ".join(f"{c['name']}: {c.get('appearance','')} ({c.get('description','')}); continuity rules: {c.get('reference_prompt','')}" for c in chars) or "No named character profile; use scene-appropriate characters."
+        prompt=f"{req.style}. Panel {i+1} of {req.panel_count}; visual continuity across the same story. Character bible: {char_bible}. Scene/action: {beat}. Compose as a single comic/webtoon panel, consistent face, hairstyle, clothing and proportions, clear focal point, no extra fingers, no text or speech bubbles, leave readable negative space for later lettering."
+        panel={"number":i+1,"beat":beat,"prompt":prompt,"image_url":None,"status":"prompt_ready"}
+        if req.generate_images:
+            try:
+                from services.image_generator import ImageGeneratorService
+                cfg=dict(req.image or {})
+                provider=str(cfg.get('provider','placeholder')).lower()
+                if provider not in IMAGE_PROVIDERS: raise ValueError('Unbekannter Bildanbieter.')
+                missing=[f for f in REQUIRED[provider] if not str(cfg.get(f,'')).strip()]
+                if missing: raise ValueError('Bildanbieter benötigt: '+', '.join(missing))
+                path=await ImageGeneratorService().generate_asset(cfg,prompt,negative_prompt="inconsistent character design, watermark, logo, blurry face",reference=reference)
+                panel['image_url']='/static/assets/'+path.name; panel['status']='generated'
+            except Exception as exc:
+                panel['status']='image_error'; panel['error']=str(exc)[:300]
+        panels.append(panel)
+    story={"title":req.title.strip(),"premise":req.premise.strip(),"style":req.style,"language":req.language,"panel_count":req.panel_count,"character_ids":req.character_ids,"characters":[{k:v for k,v in c.items() if k != "reference_image_data_url"} for c in chars],"panels":panels,"reference_used":bool(reference)}
+    return save_story(story)
+
+
+class BossChatRequest(BaseModel):
+    provider: str = Field(min_length=1, max_length=40)
+    api_key: str = Field(default="", max_length=2000)
+    model: str = Field(default="", max_length=200)
+    base_url: str = Field(default="", max_length=1000)
+    message: str = Field(min_length=1, max_length=6000)
+    history: list[dict] = Field(default_factory=list, max_length=20)
+    attachments: list[dict] = Field(default_factory=list, max_length=3)
+
+
+@app.post("/api/boss/chat")
+async def boss_chat(req: BossChatRequest):
+    """Boss-Chat: antwortet und schlägt einen passenden vorhandenen Workflow vor."""
+    provider = req.provider.strip().lower()
+    if provider not in PROVIDERS:
+        raise HTTPException(422, "Unbekannter KI-Anbieter.")
+    if provider != "custom" and not req.api_key.strip():
+        raise HTTPException(422, f"Für {provider} fehlt der API-Key.")
+    if provider == "custom" and (not req.base_url.startswith(("http://", "https://")) or not req.model.strip()):
+        raise HTTPException(422, "Beim eigenen Anbieter werden Base-URL und Modellname benötigt.")
+    history = []
+    for item in req.history[-12:]:
+        role = item.get("role")
+        content = str(item.get("content", ""))[:3000]
+        if role in ("user", "assistant") and content:
+            history.append({"role": role, "content": content})
+    saved_attachments = []
+    attachment_notes = []
+    media_analysis = []
+    video_reference_frame_data_url = ""
+    attachment_dir = BASE / "output" / "assets" / "boss-attachments"
+    attachment_dir.mkdir(parents=True, exist_ok=True)
+    for item in req.attachments[:3]:
+        name = Path(str(item.get("name", "referenz"))).name[:160]
+        kind = str(item.get("kind", ""))
+        mime = str(item.get("type", "")).lower()
+        data_url = str(item.get("data_url", ""))
+        if kind not in {"image", "video"} or not ((kind == "image" and mime.startswith("image/")) or (kind == "video" and mime.startswith("video/"))):
+            raise HTTPException(422, "Anhang muss ein Bild oder Video sein.")
+        match = re.fullmatch(r"data:([a-zA-Z0-9.+/-]+);base64,([A-Za-z0-9+/=\r\n]+)", data_url)
+        if not match or match.group(1).lower() != mime:
+            raise HTTPException(422, "Anhang hat ein ungültiges Dateiformat.")
+        try:
+            raw = base64.b64decode(match.group(2), validate=True)
+        except Exception as exc:
+            raise HTTPException(422, "Anhang konnte nicht dekodiert werden.") from exc
+        if not raw or len(raw) > 12 * 1024 * 1024:
+            raise HTTPException(413, "Anhänge dürfen maximal 12 MB groß sein.")
+        ext = Path(name).suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
+            ext = ".jpg" if mime == "image/jpeg" else ".png" if mime == "image/png" else ".webp" if mime == "image/webp" else ".mp4" if mime == "video/mp4" else ".webm" if mime == "video/webm" else ".bin"
+        file_name = f"{uuid.uuid4().hex}{ext}"
+        destination = attachment_dir / file_name
+        destination.write_bytes(raw)
+        public_url = f"/static/assets/boss-attachments/{file_name}"
+        saved_attachments.append({"name": name, "kind": kind, "type": mime, "url": public_url, "size": len(raw)})
+        attachment_note = {"name": name, "kind": kind, "type": mime, "stored_reference": public_url, "size_bytes": len(raw)}
+        attachment_notes.append(attachment_note)
+
+        # Analyse media, not just save it. Images go to the selected vision-capable LLM.
+        # Videos are sampled into representative frames with ffmpeg, then those frames are analysed.
+        try:
+            vision = LLMGateway()
+            frames = []
+            if kind == "image":
+                try:
+                    from PIL import Image
+                    from io import BytesIO
+                    im = Image.open(BytesIO(raw)).convert("RGB")
+                    im.thumbnail((1024, 1024))
+                    buff = BytesIO(); im.save(buff, format="JPEG", quality=85)
+                    image_b64 = base64.b64encode(buff.getvalue()).decode("ascii")
+                    frames.append({"label": "Bild", "mime": "image/jpeg", "b64": image_b64})
+                    ref_im = im.copy(); ref_im.thumbnail((512, 512)); ref_buff = BytesIO(); ref_im.save(ref_buff, format="JPEG", quality=70)
+                    video_reference_frame_data_url = "data:image/jpeg;base64," + base64.b64encode(ref_buff.getvalue()).decode("ascii")
+                except Exception as exc:
+                    raise ValueError("Bild konnte nicht gelesen werden.") from exc
+            else:
+                with tempfile.TemporaryDirectory(prefix="a1-boss-video-") as temp_dir:
+                    source = Path(temp_dir) / ("input" + (ext if ext != ".bin" else ".mp4"))
+                    source.write_bytes(raw)
+                    # Take three frames across the clip; ffmpeg is shipped/installed with the app host.
+                    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(source)], capture_output=True, text=True, timeout=10, check=True)
+                    try: duration = max(0.1, float(probe.stdout.strip()))
+                    except Exception: duration = 1.0
+                    for idx, fraction in enumerate((0.1, 0.5, 0.9), start=1):
+                        frame_path = Path(temp_dir) / f"frame-{idx}.jpg"
+                        # Analyse three representative points across the clip.
+                        timestamp = max(0.0, duration * fraction)
+                        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", str(timestamp), "-i", str(source), "-frames:v", "1", "-vf", "scale=1024:-2", "-y", str(frame_path)], capture_output=True, text=True, timeout=20, check=True)
+                        if frame_path.exists() and frame_path.stat().st_size:
+                            frame_b64 = base64.b64encode(frame_path.read_bytes()).decode("ascii")
+                            frames.append({"label": f"Videoframe {idx} ({timestamp:.1f}s)", "mime": "image/jpeg", "b64": frame_b64})
+                            if idx == 1:
+                                from PIL import Image
+                                from io import BytesIO
+                                ref_im = Image.open(frame_path).convert("RGB"); ref_im.thumbnail((512, 512)); ref_buff = BytesIO(); ref_im.save(ref_buff, format="JPEG", quality=70)
+                                video_reference_frame_data_url = "data:image/jpeg;base64," + base64.b64encode(ref_buff.getvalue()).decode("ascii")
+                    if not frames:
+                        raise ValueError("Aus dem Video konnten keine Einzelbilder gelesen werden.")
+            frame_summaries = []
+            for frame in frames:
+                prompt = ("Analysiere dieses Bild als visuelle Referenz für eine Kreativproduktion. Beschreibe knapp Motiv, Personen/Objekte, Bildaufbau, Farben, Stil, Licht, Text im Bild und wichtige Details. Erfinde keine nicht sichtbaren Fakten. Antworte auf Deutsch.")
+                summary = await vision.generate_text(provider, req.api_key.strip(), "Du bist ein präziser visueller Analyse-Assistent.", prompt, req.model.strip() or None, req.base_url.strip() or None, image={"mime": frame["mime"], "b64": frame["b64"]})
+                frame_summaries.append({"frame": frame["label"], "summary": summary[:1800]})
+            media_analysis.append({"name": name, "kind": kind, "frames": frame_summaries})
+            attachment_note["visual_analysis"] = frame_summaries
+        except FileNotFoundError as exc:
+            raise HTTPException(500, "Für die Videoanalyse fehlt ffmpeg/ffprobe auf dem Backend-System.") from exc
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+            raise HTTPException(422, f"Die Mediendatei {name} konnte nicht analysiert werden. Prüfe das Format und versuche es erneut.") from exc
+        except LLMError as exc:
+            raise HTTPException(502, f"Die Medienanalyse ist fehlgeschlagen: {str(exc)[:350]}") from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    user_prompt = json.dumps({"conversation": history, "new_message": req.message.strip(), "attached_references": attachment_notes}, ensure_ascii=False)
+    system = """Du bist Boss, der koordinierende Leiter der A1 Factory. Antworte auf Deutsch, knapp und konkret. Wenn visuelle Analysen zu Anhängen vorliegen, verwende sie als tatsächlichen Kontext für Empfehlungen und Produktionsprompts. Erkläre bei Videos, dass du repräsentative Frames analysiert hast, nicht jedes Einzelbild. Die verfügbaren Workflows sind: factory (Scout findet Produktidee, Designer erzeugt Motiv, Publisher schreibt Listing und kann Entwurf anlegen), studio (Merch-/Brand-/Mockup-Design), content (Thumbnails, Streamer-Paket, Banner), story (Storytelling), game-assets (Spielgrafiken), media (Audio/Video). Du kannst planen und passende Workflows vorschlagen, aber behaupte niemals, dass Agenten bereits ausgeführt wurden oder Dateien erstellt wurden. Gib ausschließlich valides JSON zurück mit genau diesen Feldern: reply (String), workflow (factory|studio|content|story|game-assets|media|none), category (String, kurze Aufgaben-/Themenbeschreibung), next_step (String, kurze nächste Aktion). Wenn keine Produktion angefragt ist, workflow=none. Wenn unklar, stelle eine kurze Rückfrage und workflow=none. Keine externen Aktionen ohne Bestätigung."""
+    try:
+        result = await LLMGateway().generate_json(provider, req.api_key.strip(), system, user_prompt,
+                                                  req.model.strip() or None, req.base_url.strip() or None, retries=1)
+    except LLMError as exc:
+        msg = str(exc)
+        raise HTTPException(502, msg[:500]) from exc
+    workflow = result.get("workflow", "none")
+    if workflow not in {"factory", "studio", "content", "story", "game-assets", "media", "none"}:
+        workflow = "none"
+    reply = str(result.get("reply", "Ich konnte keine Antwort erzeugen."))[:5000]
+    if saved_attachments:
+        names = ", ".join(item["name"] for item in saved_attachments)
+        reply += f"\n\nAngehängte Referenz(en) gespeichert: {names}."
+    return {"reply": reply, "attachments": saved_attachments, "media_analysis": media_analysis,
+            "video_reference_frame_data_url": video_reference_frame_data_url,
+            "workflow": workflow, "category": str(result.get("category", ""))[:300],
+            "next_step": str(result.get("next_step", ""))[:500]}
+
+
+class ModelsReq(BaseModel):
+    provider: str
+    api_key: str = ""
+    base_url: str = ""
+
+
+@app.post("/models")
+async def models(req: ModelsReq):
+    """Modellliste eines Anbieters. Der Key wird nur für diese Anfrage genutzt, nicht gespeichert."""
+    try:
+        return {"models": await LLMGateway().list_models(req.provider.lower(), req.api_key.strip(), req.base_url.strip())}
+    except LLMError as e:
+        msg = str(e)
+        raise HTTPException(400, "Key wurde abgelehnt." if "HTTP 401" in msg or "HTTP 403" in msg else msg)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Anbieter nicht erreichbar: {e}")
+
+
+def validate(cmd: dict, publish: bool):
+    provider = str(cmd.get("provider", "")).lower()
+    category = str(cmd.get("category", "")).strip()[:120]
+    if provider not in PROVIDERS or not category:
+        return "Nische oder Anbieter ungültig."
+    if provider == "custom":
+        if not str(cmd.get("base_url", "")).strip() or not str(cmd.get("model", "")).strip():
+            return "Eigener Anbieter: Base-URL und Modellname fehlen."
+    elif not str(cmd.get("api_key", "")).strip():
+        return f"Es fehlt der Key für {provider}."
+    img = cmd.get("image") or {}
+    ip = str(img.get("provider", "pollinations")).lower()
+    if ip not in IMAGE_PROVIDERS:
+        return "Unbekannter Bildanbieter."
+    miss = [f for f in REQUIRED[ip] if not str(img.get(f, "")).strip()]
+    if miss:
+        return f"Bildanbieter {ip}: Angaben fehlen ({', '.join(miss)})."
+    ref = cmd.get("reference")
+    if ref:
+        if not isinstance(ref, dict) or ref.get("mode") not in (("style", "direct", "asset") if cmd.get("action") == "start_content" else ("style", "direct")):
+            return "Referenzbild: ungültiger Modus."
+        if not REF_RE.match(str(ref.get("data_url", ""))) or len(str(ref.get("data_url"))) > 8_000_000:
+            return "Referenzbild: ungültig oder zu groß (PNG, JPEG oder WebP bis ca. 6 MB)."
+        if ref["mode"] == "direct" and ip not in IMG2IMG:
+            return "Bild-zu-Bild geht nur mit Gemini, OpenAI oder Lokal. Wähl 'Stil übernehmen' oder wechsle den Bildanbieter."
+    if cmd.get("shopify_enabled"):
+        sh = cmd.get("shopify") or {}
+        g = lambda k: str(sh.get(k, "")).strip()
+        if not SHOP_RE.match(g("shop").lower()):
+            return "Shopify: Die Shop-Adresse muss wie mein-shop.myshopify.com aussehen."
+        if not g("access_token") and not (g("client_id") and g("client_secret")):
+            return "Shopify: Trag entweder den Admin-Token oder Client-ID und Client-Secret ein."
+    if publish:
+        etsy = cmd.get("etsy") or {}
+        missing = [f for f in ETSY_FIELDS if not str(etsy.get(f, "")).strip()]
+        if missing:
+            return "Etsy-Angaben fehlen: " + ", ".join(missing)
+    return None
+
+
+def validate_studio(cmd: dict):
+    err = validate(cmd, False)
+    if err:
+        return err
+    mods = cmd.get("modules")
+    if not isinstance(mods, list) or not mods or any(m not in MODULES for m in mods):
+        return "Wähl mindestens ein Modul (Merch, Brand-Kit, Mockups)."
+    return None
+
+
+def validate_content(cmd: dict):
+    err = validate(cmd, False)
+    if err:
+        return err
+    mods = cmd.get("modules")
+    if not isinstance(mods, list) or not mods or any(m not in CONTENT_MODULES for m in mods):
+        return "Wähl mindestens ein Modul (Thumbnails, Streamer-Paket, Banner)."
+    if "thumbnails" in mods and not (isinstance(cmd.get("formats"), list) and cmd["formats"] and all(f in FORMATS for f in cmd["formats"])):
+        return "Wähl mindestens ein Thumbnail-Format."
+    if "banners" in mods and not (isinstance(cmd.get("banners"), list) and cmd["banners"] and all(b in BANNERS for b in cmd["banners"])):
+        return "Wähl mindestens ein Banner-Format."
+    return None
+
+
+async def run_job(sess: Session, cmd: dict, publish: bool):
+    try:
+        count = max(1, min(5, int(cmd.get("image_count", 1))))
+    except (TypeError, ValueError):
+        count = 1
+    keys = {"llm_key": str(cmd.get("api_key", "")).strip(), "base_url": str(cmd.get("base_url", "")).strip(), "model": str(cmd.get("model", "")).strip(),
+            "image": {k: str((cmd.get("image") or {}).get(k, "")).strip() for k in ("provider", "key", "account_id", "base_url", "model")},
+            "etsy": {k: str((cmd.get("etsy") or {}).get(k, "")).strip() for k in ETSY_FIELDS},
+            "mockups": bool(cmd.get("mockups")), "shopify_on": bool(cmd.get("shopify_enabled")),
+            "shopify": {k: str((cmd.get("shopify") or {}).get(k, "")).strip() for k in SHOPIFY_FIELDS}}
+    m = REF_RE.match(str((cmd.get("reference") or {}).get("data_url", "")))
+    keys["reference"] = {"mime": m.group(1), "b64": re.sub(r"\s", "", m.group(2)), "mode": cmd["reference"]["mode"]} if m else None
+    niche, provider = str(cmd["category"]).strip()[:120], cmd["provider"].lower()
+    try:
+        if cmd.get("action") == "start_content":
+            opts = {"variants": max(1, min(3, count)), "formats": cmd.get("formats") or ["yt"], "banners": cmd.get("banners") or [],
+                    "language": "Englisch" if cmd.get("language") == "Englisch" else "Deutsch", "hint": str(cmd.get("hint", "")).strip()[:300]}
+            await ContentPipeline(sess).run(niche, provider, cmd["modules"], keys, opts)
+        elif cmd.get("action") == "start_studio":
+            await StudioPipeline(sess).run(niche, provider, cmd["modules"], keys, max(1, min(3, count)))
+        else:
+            await AgentFactoryPipeline(sess).run(niche, provider, publish, keys, count)
+    finally:
+        sess.running = False
+
+
+@app.websocket("/ws/factory")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    sess = Session(ws)
+    await sess.send("HELLO", {"providers": PROVIDERS})
+    try:
+        while True:
+            cmd = json.loads(await ws.receive_text())
+            act = cmd.get("action")
+            if act not in ("start_production", "start_studio", "start_content"):
+                continue
+            publish = bool(cmd.get("publish", False)) and act == "start_production"
+            err = "Es läuft bereits ein Durchlauf." if sess.running else (
+                validate_studio(cmd) if act == "start_studio" else validate_content(cmd) if act == "start_content" else validate(cmd, publish))
+            if err:
+                await sess.send("RUN_FAILED", {"stage": "factory", "error": err})
+                await sess.send("RUN_FINISHED", {})
+            else:
+                sess.running = True
+                asyncio.create_task(run_job(sess, cmd, publish))
+    except WebSocketDisconnect:
+        pass

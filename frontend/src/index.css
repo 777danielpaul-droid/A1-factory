@@ -1,0 +1,118 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { --a1-accent: #8B5CF6; --a1-bg: #080a10; --a1-panel: rgba(18, 22, 33, .78); --a1-line: rgba(180, 190, 220, .17); }
+* { box-sizing: border-box; }
+html { background: var(--a1-bg); }
+body { margin: 0; font-family: 'Manrope', system-ui, sans-serif; background: radial-gradient(ellipse at 12% 0%, color-mix(in srgb, var(--a1-accent) 13%, transparent), transparent 38%), radial-gradient(ellipse at 90% 18%, rgba(36, 86, 145, .12), transparent 34%), var(--a1-bg); color: #edf0f8; min-height: 100vh; }
+button, input, select, textarea { font: inherit; }
+button { transition: border-color .18s ease, background-color .18s ease, box-shadow .18s ease, transform .18s ease; }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--a1-accent) !important; outline-offset: 2px; }
+.display { font-family: 'Manrope', system-ui, sans-serif; letter-spacing: -.035em; }
+.a1-app { position: relative; isolation: isolate; }
+.a1-app::before { content: ''; position: fixed; z-index: -1; inset: 0; pointer-events: none; opacity: .22; background-image: linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px); background-size: 34px 34px; mask-image: linear-gradient(to bottom, black, transparent 85%); }
+.a1-app > .max-w-6xl { max-width: 1480px; }
+.a1-header { padding: 18px 0 22px; border-bottom: 1px solid var(--a1-line); }
+.a1-mark { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border: 1px solid var(--a1-accent); color: var(--a1-accent); font-family: 'IBM Plex Mono', monospace; font-weight: 600; box-shadow: 0 0 24px color-mix(in srgb, var(--a1-accent) 24%, transparent), inset 0 0 18px color-mix(in srgb, var(--a1-accent) 12%, transparent); }
+.a1-header h1 { color: #f7f8ff; letter-spacing: -.055em; }
+.a1-header p { color: #858da3 !important; letter-spacing: .11em; font-family: 'IBM Plex Mono', monospace; font-size: 10px !important; }
+.a1-separator { color: var(--a1-accent); padding: 0 7px; }
+.a1-header-tools { align-self: center; }
+.a1-color-control { position: relative; display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 7px 10px; border: 1px solid var(--a1-line); background: rgba(17, 21, 32, .75); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); cursor: pointer; }
+.a1-color-control:hover { border-color: color-mix(in srgb, var(--a1-accent) 65%, white 0%); box-shadow: 0 0 22px color-mix(in srgb, var(--a1-accent) 15%, transparent); }
+.a1-color-control input[type=color] { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.a1-color-swatch { width: 17px; height: 17px; border: 1px solid rgba(255,255,255,.5); box-shadow: 0 0 14px color-mix(in srgb, var(--a1-accent) 45%, transparent); }
+.a1-color-label, .a1-hex { font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: .08em; }
+.a1-color-label { color: #8c95aa; }
+.a1-hex { color: #e7eaf4; }
+.a1-connection { display: inline-flex; align-items: center; gap: 7px; background: rgba(22, 27, 40, .8) !important; border: 1px solid var(--a1-line); color: #c9d0df !important; }
+.a1-status-dot { width: 6px; height: 6px; background: #58d7a4; box-shadow: 0 0 10px rgba(88,215,164,.7); }
+.a1-app [role=tablist] { gap: 0 !important; border-bottom: 1px solid var(--a1-line); overflow-x: auto; }
+.a1-app [role=tab] { flex: 0 0 auto; border-radius: 0 !important; border-bottom-width: 2px !important; border-bottom-color: transparent !important; color: #929bb0 !important; background: transparent !important; padding: 14px 17px !important; font-size: 12px !important; letter-spacing: .01em; }
+.a1-app [role=tab][aria-selected=true] { color: #fff !important; border-bottom-color: var(--a1-accent) !important; background: linear-gradient(0deg, color-mix(in srgb, var(--a1-accent) 12%, transparent), transparent) !important; box-shadow: 0 8px 20px -14px var(--a1-accent); }
+.a1-app [role=tab]:hover { color: #fff !important; }
+/* Square-corner glass system: no rounded cards, fields, menus or buttons. */
+.a1-app [class*="rounded"] { border-radius: 0 !important; }
+.a1-app section, .a1-app article, .a1-app [role=tabpanel] { border-color: var(--a1-line) !important; background-color: var(--a1-panel); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); box-shadow: 0 0 30px -22px var(--a1-accent), inset 0 1px 0 rgba(255,255,255,.035); }
+.a1-app .bg-white, .a1-app [class*="bg-[#F"], .a1-app [class*="bg-stone-50"], .a1-app [class*="bg-stone-100"] { background-color: rgba(23, 28, 41, .78) !important; color: #e9edf7 !important; }
+.a1-app [class*="border-stone-"], .a1-app [class*="border-[#E8590C]"] { border-color: var(--a1-line) !important; }
+.a1-app [class*="border-[#E8590C]"] { border-color: color-mix(in srgb, var(--a1-accent) 70%, transparent) !important; }
+.a1-app [class*="bg-[#FFF4EC]"], .a1-app [class*="bg-[#EFEDE7]"] { background: color-mix(in srgb, var(--a1-accent) 9%, rgba(17, 21, 32, .9)) !important; }
+.a1-app [class*="bg-[#E8590C]"] { background: var(--a1-accent) !important; color: #fff !important; }
+.a1-app [class*="text-stone-600"], .a1-app [class*="text-stone-700"], .a1-app [class*="text-stone-500"] { color: #a2abc0 !important; }
+.a1-app [class*="text-stone-800"] { color: #e9edf7 !important; }
+.a1-app input:not([type=checkbox]):not([type=color]), .a1-app textarea, .a1-app select { background: rgba(7, 10, 17, .76) !important; color: #f0f3fb !important; border-color: var(--a1-line) !important; border-radius: 0 !important; }
+.a1-app input::placeholder, .a1-app textarea::placeholder { color: #737d93 !important; }
+.a1-app button { border-radius: 0 !important; }
+.a1-app button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--a1-accent) 68%, transparent); box-shadow: 0 0 20px -12px var(--a1-accent); }
+.a1-app button[class*="bg-[#E8590C]"] { border: 1px solid color-mix(in srgb, var(--a1-accent) 78%, white 0%); box-shadow: 0 0 24px -13px var(--a1-accent); }
+.a1-app .text-red-700 { color: #ff8b99 !important; }
+.a1-app .bg-red-700 { background: #8e2e40 !important; }
+.a1-app .bg-emerald-700 { background: #155b4d !important; }
+.a1-app img, .a1-app video { border-radius: 0 !important; }
+.a1-app [class*="shadow"] { box-shadow: 0 0 24px -17px var(--a1-accent); }
+.a1-app .animate-pulse { animation-duration: 1.8s; }
+.checker { background-color: #fff; background-image: conic-gradient(#e5e5e5 25%, transparent 25% 50%, #e5e5e5 50% 75%, transparent 75%); background-size: 16px 16px; }
+@media (max-width: 640px) { .a1-header { align-items: flex-start; } .a1-header-tools { width: 100%; justify-content: space-between; } .a1-app [role=tab] { padding: 12px 13px !important; } }
+
+/* Decorative, non-interactive rotating globe behind the workspace. */
+.a1-globe-background { position: fixed; z-index: 0; pointer-events: none; width: min(62vw, 820px); height: min(62vw, 820px); right: -2vw; bottom: -7vh; opacity: .9; filter: saturate(1.08); }
+.a1-content { position: relative; z-index: 1; }
+@media (max-width: 700px) { .a1-globe-background { width: 100vw; height: 100vw; right: -27vw; bottom: -3vh; opacity: .52; } }
+@media (prefers-reduced-motion: reduce) { .a1-globe-background { opacity: .3; } }
+
+
+/* Keep the globe visible through a genuinely translucent glass chat surface. */
+.a1-app section:has(h2) { background: rgba(10, 14, 24, .34) !important; backdrop-filter: blur(9px) saturate(120%) !important; -webkit-backdrop-filter: blur(9px) saturate(120%) !important; box-shadow: 0 0 42px -18px color-mix(in srgb, var(--a1-accent) 38%, transparent), inset 0 1px 0 rgba(255,255,255,.08) !important; }
+.a1-app section:has(h2) > div[aria-live="polite"] { background: rgba(5, 9, 17, .24) !important; backdrop-filter: blur(3px) !important; -webkit-backdrop-filter: blur(3px) !important; border-color: color-mix(in srgb, var(--a1-accent) 25%, rgba(180,190,220,.22)) !important; }
+.a1-app section:has(h2) > div[aria-live="polite"] > div > div { background: rgba(12, 17, 29, .52) !important; border-color: rgba(190,205,235,.17) !important; backdrop-filter: blur(5px) !important; -webkit-backdrop-filter: blur(5px) !important; }
+.a1-app section:has(h2) > div[aria-live="polite"] > div > div.bg-stone-800 { background: color-mix(in srgb, var(--a1-accent) 28%, rgba(8,12,22,.68)) !important; }
+
+/* Boss chat: force real translucency so the animated globe remains visible. */
+.a1-app section:has(> div[aria-live="polite"]) {
+  background: rgba(8, 12, 22, .20) !important;
+  background-color: rgba(8, 12, 22, .20) !important;
+  backdrop-filter: blur(8px) saturate(125%) !important;
+  -webkit-backdrop-filter: blur(8px) saturate(125%) !important;
+  border-color: color-mix(in srgb, var(--a1-accent) 35%, rgba(180,190,220,.24)) !important;
+}
+.a1-app section:has(> div[aria-live="polite"]) > div[aria-live="polite"] {
+  background: rgba(5, 9, 17, .12) !important;
+  background-color: rgba(5, 9, 17, .12) !important;
+  backdrop-filter: blur(2px) saturate(115%) !important;
+  -webkit-backdrop-filter: blur(2px) saturate(115%) !important;
+}
+.a1-app section:has(> div[aria-live="polite"]) > div[aria-live="polite"] > div > div {
+  background: rgba(11, 16, 28, .22) !important;
+  background-color: rgba(11, 16, 28, .22) !important;
+  backdrop-filter: blur(4px) saturate(120%) !important;
+  -webkit-backdrop-filter: blur(4px) saturate(120%) !important;
+  border-color: rgba(190,205,235,.22) !important;
+}
+.a1-app section:has(> div[aria-live="polite"]) > div[aria-live="polite"] > div > div.bg-stone-800 {
+  background: color-mix(in srgb, var(--a1-accent) 24%, rgba(8,12,22,.32)) !important;
+  background-color: color-mix(in srgb, var(--a1-accent) 24%, rgba(8,12,22,.32)) !important;
+}
+.a1-app section:has(> div[aria-live="polite"]) > div[aria-live="polite"] > div > div.bg-white,
+.a1-app section:has(> div[aria-live="polite"]) > div[aria-live="polite"] > div > div[class*="bg-[#F"] {
+  background: rgba(13, 18, 31, .20) !important;
+  background-color: rgba(13, 18, 31, .20) !important;
+}
+.a1-app section:has(> div[aria-live="polite"]) input:not([type="checkbox"]):not([type="color"]),
+.a1-app section:has(> div[aria-live="polite"]) textarea,
+.a1-app section:has(> div[aria-live="polite"]) select {
+  background: rgba(5, 9, 17, .22) !important;
+  background-color: rgba(5, 9, 17, .22) !important;
+  backdrop-filter: blur(6px) !important;
+  -webkit-backdrop-filter: blur(6px) !important;
+}
+.a1-app section:has(> div[aria-live="polite"]) .bg-stone-50,
+.a1-app section:has(> div[aria-live="polite"]) .bg-white,
+.a1-app section:has(> div[aria-live="polite"]) [class*="bg-[#FFF4EC]"] {
+  background-color: rgba(12, 17, 29, .24) !important;
+  backdrop-filter: blur(6px) saturate(120%) !important;
+  -webkit-backdrop-filter: blur(6px) saturate(120%) !important;
+}
+.a1-globe-background { opacity: 1 !important; }
